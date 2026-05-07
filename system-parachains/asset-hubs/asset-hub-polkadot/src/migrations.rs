@@ -92,6 +92,9 @@ pub type Unreleased = (
 		DefaultDapBudget,
 		crate::dynamic_params::staking_election::MaxEraDuration,
 	>,
+	// PSM bootstrap: mint internal stable from Treasury USDT, seed AMM pool, fund
+	// Treasury sovereign on Hydration.
+	crate::stable::migration::InitInternalStableLiquidity,
 );
 
 /// Migrations/checks that do not need to be versioned and can run on every update.
