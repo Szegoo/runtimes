@@ -22,21 +22,21 @@
 //!
 //! ## Contents
 //!
-//! - [`PsmPalletId`] / [`PsmFeeDestinationPalletId`] — sub-account derivation for the PSM
-//!   custody account and the fee-destination (insurance fund).
+//! - [`PsmPalletId`] / [`PsmFeeDestinationPalletId`] — sub-account derivation for the PSM custody
+//!   account and the fee-destination (insurance fund).
 //! - [`InternalStableAssetId`] — storage-backed `AssetId` of the internal stablecoin in the
-//!   TrustBacked `pallet_assets` instance. Set by [`migration::InitInternalStableLiquidity`]
-//!   from `pallet_assets::NextAssetId` at bootstrap time.
-//! - [`PsmFullLevel`] / [`PsmEmergencyOrigin`] — origin-to-`PsmManagerLevel` mapping. `Root`
-//!   gets `Full`; the `WhitelistedCaller` track gets `Emergency` (to be replaced with a
-//!   dedicated `MonetaryGuard` track).
-//! - [`PsmInternalAsset`] — single-asset `fungible` view over `pallet_assets` that
-//!   `pallet_psm` uses to mint/burn the internal stablecoin.
+//!   TrustBacked `pallet_assets` instance. Set by [`migration::InitInternalStableLiquidity`] from
+//!   `pallet_assets::NextAssetId` at bootstrap time.
+//! - [`PsmFullLevel`] / [`PsmEmergencyOrigin`] — origin-to-`PsmManagerLevel` mapping. `Root` gets
+//!   `Full`; the `WhitelistedCaller` track gets `Emergency` (to be replaced with a dedicated
+//!   `MonetaryGuard` track).
+//! - [`PsmInternalAsset`] — single-asset `fungible` view over `pallet_assets` that `pallet_psm`
+//!   uses to mint/burn the internal stablecoin.
 //! - [`PsmBenchmarkHelper`] — runtime-benchmarks helper that fabricates unique foreign-asset
 //!   `Location`s in `ForeignAssets` so PSM benchmarks exercise the cross-chain path.
-//! - [`migration`] — one-shot bootstrap that creates the internal stablecoin, PSM-mints
-//!   against USDT, seeds the DOT/internal-stable pool, and pushes initial liquidity to
-//!   Hydration. See the module docs for details.
+//! - [`migration`] — one-shot bootstrap that creates the internal stablecoin, PSM-mints against
+//!   USDT, seeds the DOT/internal-stable pool, and pushes initial liquidity to Hydration. See the
+//!   module docs for details.
 
 use crate::*;
 
@@ -51,7 +51,7 @@ parameter_types! {
 	/// Maximum number of approved external stablecoins.
 	pub const PsmMaxExternalAssets: u32 = 4;
 
-	/// Asset id of the internal stablecoin. 
+	/// Asset id of the internal stablecoin.
 	pub storage InternalStableAssetId: AssetIdForTrustBackedAssets = 0;
 }
 
@@ -154,16 +154,16 @@ impl pallet_psm::Config for Runtime {
 ///
 /// 1. Reads the next auto-incremented id from `pallet_assets::NextAssetId` and stores it in
 ///    [`InternalStableAssetId`]. Aborts (with logged error) if unset.
-/// 2. `force_create`s the asset with the PSM-derived account as owner/issuer/admin/freezer so
-///    that [`pallet_psm`] can mint against it, and `force_set_metadata` writes the placeholder
+/// 2. `force_create`s the asset with the PSM-derived account as owner/issuer/admin/freezer so that
+///    [`pallet_psm`] can mint against it, and `force_set_metadata` writes the placeholder
 ///    name/symbol/decimals.
 /// 3. Treasury PSM-mints [`PSM_MINT_AMOUNT`] of internal stable against USDT (TrustBacked id
 ///    [`USDT_ASSET_ID`]).
 /// 4. Creates the DOT/internal-stable pool in `pallet_asset_conversion` and seeds it with
 ///    [`POOL_DOT_AMOUNT`] DOT + [`POOL_STABLE_AMOUNT`] internal stable from Treasury.
-/// 5. Reserve-transfers [`TO_HYDRATION_AMOUNT`] of internal stable to the AH Treasury's
-///    sovereign account on Hydration (para `2034`), resolved via Hydration's
-///    `HashedDescription` `LocationToAccountId`.
+/// 5. Reserve-transfers [`TO_HYDRATION_AMOUNT`] of internal stable to the AH Treasury's sovereign
+///    account on Hydration (para `2034`), resolved via Hydration's `HashedDescription`
+///    `LocationToAccountId`.
 ///
 /// Steps 2–5 log on failure rather than aborting: the asset must exist for anything else to
 /// be meaningful, but a missing pool, failed mint, or failed XCM transfer can be retried via
@@ -296,11 +296,7 @@ pub mod migration {
 			);
 
 			// Treasury PSM-mints internal stable against 1.5M USDT.
-			match pallet_psm::Pallet::<Runtime>::mint(
-				origin.clone(),
-				usdt_loc,
-				PSM_MINT_AMOUNT,
-			) {
+			match pallet_psm::Pallet::<Runtime>::mint(origin.clone(), usdt_loc, PSM_MINT_AMOUNT) {
 				Ok(_) => log::info!(
 					target: "runtime::stable-init",
 					"PSM mint OK: {} USDT-base-units swapped for internal stable",
@@ -364,10 +360,7 @@ pub mod migration {
 				1,
 				[
 					Junction::Parachain(ASSET_HUB_PARA_ID),
-					Junction::AccountId32 {
-						id: <[u8; 32]>::from(treasury.clone()),
-						network: None,
-					},
+					Junction::AccountId32 { id: <[u8; 32]>::from(treasury.clone()), network: None },
 				],
 			);
 			let assets: xcm::v5::Assets = (stable_loc, TO_HYDRATION_AMOUNT).into();
@@ -396,5 +389,25 @@ pub mod migration {
 			// migration runs will already include normal block work, so leave headroom.
 			Weight::from_parts(2_000_000_000_000, 1_000_000)
 		}
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	#[test]
+	pub fn assert_keyless_account_id() {
+		use sp_core::crypto::{Ss58AddressFormat, Ss58Codec};
+		use xcm_executor::traits::ConvertLocation;
+
+		let relay_location = Location::new(1, Junctions::Here);
+		let address = LocationToAccountId::convert_location(&relay_location).unwrap();
+
+		let polkadot = Ss58AddressFormat::try_from("polkadot").unwrap();
+		let ss58_address = Ss58Codec::to_ss58check_with_version(&address, polkadot);
+
+		// Relay Chain Sovereign Account on Hub.
+		assert_eq!(ss58_address, "12pPnA1aFic3ibBh9xMwssM1779vfrJBxqD4mDy8d18r4g95");
 	}
 }
