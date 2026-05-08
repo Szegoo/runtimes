@@ -15,8 +15,28 @@
 
 //! Peg Stability Module (PSM) configuration.
 //!
-//! The internal stablecoin asset id, hard issuance cap, and minimum swap amount are
-//! Root-configurable via `dynamic_params::psm` (defined in `lib.rs`).
+//! Wires `pallet_psm` into the Asset Hub runtime: the PSM lets approved external stablecoins
+//! (e.g. USDT, Hollar) be swapped 1:1 for the Asset Hub-issued *internal stablecoin* up to
+//! a governance-controlled issuance cap, with fees routed to a dedicated insurance-fund
+//! sub-account.
+//!
+//! ## Contents
+//!
+//! - [`PsmPalletId`] / [`PsmFeeDestinationPalletId`] — sub-account derivation for the PSM
+//!   custody account and the fee-destination (insurance fund).
+//! - [`InternalStableAssetId`] — storage-backed `AssetId` of the internal stablecoin in the
+//!   TrustBacked `pallet_assets` instance. Set by [`migration::InitInternalStableLiquidity`]
+//!   from `pallet_assets::NextAssetId` at bootstrap time.
+//! - [`PsmFullLevel`] / [`PsmEmergencyOrigin`] — origin-to-`PsmManagerLevel` mapping. `Root`
+//!   gets `Full`; the `WhitelistedCaller` track gets `Emergency` (to be replaced with a
+//!   dedicated `MonetaryGuard` track).
+//! - [`PsmInternalAsset`] — single-asset `fungible` view over `pallet_assets` that
+//!   `pallet_psm` uses to mint/burn the internal stablecoin.
+//! - [`PsmBenchmarkHelper`] — runtime-benchmarks helper that fabricates unique foreign-asset
+//!   `Location`s in `ForeignAssets` so PSM benchmarks exercise the cross-chain path.
+//! - [`migration`] — one-shot bootstrap that creates the internal stablecoin, PSM-mints
+//!   against USDT, seeds the DOT/internal-stable pool, and pushes initial liquidity to
+//!   Hydration. See the module docs for details.
 
 use crate::*;
 
@@ -30,6 +50,9 @@ parameter_types! {
 
 	/// Maximum number of approved external stablecoins.
 	pub const PsmMaxExternalAssets: u32 = 4;
+
+	/// Asset id of the internal stablecoin. 
+	pub storage InternalStableAssetId: AssetIdForTrustBackedAssets = 0;
 }
 
 /// `TypedGet` impl returning `PsmManagerLevel::Full`. Used to map `Root` to the full
@@ -42,10 +65,6 @@ impl sp_core::TypedGet for PsmFullLevel {
 	}
 }
 
-/// Maps the `WhitelistedCaller` origin to `PsmManagerLevel::Emergency` for the PSM
-/// circuit-breaker. Re-using the existing whitelisted-caller track keeps the PR free of
-/// new governance plumbing while still distinguishing emergency calls from full
-/// management ones at the pallet level.
 pub struct PsmEmergencyOrigin;
 impl<O> EnsureOrigin<O> for PsmEmergencyOrigin
 where
@@ -67,14 +86,7 @@ where
 }
 
 /// Single-asset `fungible` wrapper that the PSM uses to mint/burn the internal stablecoin.
-///
-/// The TrustBacked asset id is configurable at runtime via the `Parameters` pallet
-/// (`dynamic_params::psm::StablecoinAssetId`), so the internal stablecoin's asset id can
-/// be set after deployment without a runtime upgrade. The asset itself must still be
-/// pre-registered with the PSM-derived account (`PsmPalletId::into_account_truncating()`)
-/// as owner/issuer for mint/burn to succeed.
-pub type PsmInternalAsset =
-	fungible::ItemOf<Assets, dynamic_params::psm::StablecoinAssetId, AccountId>;
+pub type PsmInternalAsset = fungible::ItemOf<Assets, InternalStableAssetId, AccountId>;
 
 /// Benchmark helper for `pallet_psm`. Generates unique foreign-asset `Location`s and
 /// creates them in `ForeignAssets` with metadata so the PSM benchmarks can drive
@@ -136,20 +148,26 @@ impl pallet_psm::Config for Runtime {
 	type BenchmarkHelper = PsmBenchmarkHelper;
 }
 
-/// Bootstrap migration: at upgrade, Treasury mints internal stable from USDT, seeds the
-/// DOT/internal-stable AMM pool, and ships 1M internal stable to its sovereign on
-/// Hydration.
+/// One-shot bootstrap of the internal stablecoin and its initial liquidity.
 ///
-/// Best-effort: each step logs success/failure independently; a failure in one step does
-/// not abort the others. Steps depend on Treasury holding the required source balances
-/// (1.5M USDT + 500k DOT + the resulting 1.5M internal stable across steps).
+/// Runs as a single-block `OnRuntimeUpgrade` and performs, in order:
 ///
-/// **Hydration prerequisite**: for the cross-chain transfer step to actually credit the
-/// AH Treasury sov on Hydration, Hydration must have the AH-side internal stable
-/// registered as a foreign asset (Location
-/// `(1, [Parachain(1000), PalletInstance(50), GeneralIndex(<id>)])`) with AH set as its
-/// trusted reserve. Without that, the XCM withdraws on AH but the reserve-deposit on
-/// Hydration fails and the assets are trapped.
+/// 1. Reads the next auto-incremented id from `pallet_assets::NextAssetId` and stores it in
+///    [`InternalStableAssetId`]. Aborts (with logged error) if unset.
+/// 2. `force_create`s the asset with the PSM-derived account as owner/issuer/admin/freezer so
+///    that [`pallet_psm`] can mint against it, and `force_set_metadata` writes the placeholder
+///    name/symbol/decimals.
+/// 3. Treasury PSM-mints [`PSM_MINT_AMOUNT`] of internal stable against USDT (TrustBacked id
+///    [`USDT_ASSET_ID`]).
+/// 4. Creates the DOT/internal-stable pool in `pallet_asset_conversion` and seeds it with
+///    [`POOL_DOT_AMOUNT`] DOT + [`POOL_STABLE_AMOUNT`] internal stable from Treasury.
+/// 5. Reserve-transfers [`TO_HYDRATION_AMOUNT`] of internal stable to the AH Treasury's
+///    sovereign account on Hydration (para `2034`), resolved via Hydration's
+///    `HashedDescription` `LocationToAccountId`.
+///
+/// Steps 2–5 log on failure rather than aborting: the asset must exist for anything else to
+/// be meaningful, but a missing pool, failed mint, or failed XCM transfer can be retried via
+/// governance without re-running the whole migration.
 pub mod migration {
 	use super::*;
 	use alloc::boxed::Box;
@@ -167,10 +185,6 @@ pub mod migration {
 
 	/// Existential deposit for the internal stable: 0.01 unit @ 6 decimals.
 	const STABLE_MIN_BALANCE: Balance = 10_000;
-
-	/// Fallback asset id used when `NextAssetId` is unset. Matches the existing
-	/// `dynamic_params::psm::StablecoinAssetId` default (a pre-allocated slot).
-	const STABLE_ASSET_ID_FALLBACK: AssetIdForTrustBackedAssets = 50_000_413;
 
 	/// On-chain metadata placeholders.
 	const STABLE_NAME: &[u8] = b"Internal Stable";
@@ -206,17 +220,25 @@ pub mod migration {
 			);
 			let dot_loc = xcm_config::DotLocation::get();
 
-			// Create the internal stable asset (auto-incremented id), seed metadata, and
-			// assign the id to `dynamic_params::psm::StablecoinAssetId`.
-			//
+			// Take the next auto-incremented asset id from `pallet_assets`. If it's unset,
+			// abandon the migration.
+			let stable_id: AssetIdForTrustBackedAssets =
+				match pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::get() {
+					Some(id) => id,
+					None => {
+						log::error!(
+							target: "runtime::stable-init",
+							"NextAssetId unset; aborting bootstrap migration",
+						);
+						return Weight::from_parts(100_000_000, 10_000);
+					},
+				};
+
+			InternalStableAssetId::set(&stable_id);
+
 			// Owner/issuer/admin/freezer = PSM-derived account so `pallet_psm::mint`
 			// can issue against the asset.
 			let psm_account: AccountId = PsmPalletId::get().into_account_truncating();
-			let stable_id: AssetIdForTrustBackedAssets = pallet_assets::NextAssetId::<
-				Runtime,
-				TrustBackedAssetsInstance,
-			>::get()
-			.unwrap_or(STABLE_ASSET_ID_FALLBACK);
 
 			// Hard precondition: if the asset can't be created, every downstream step
 			// (mint, pool, cross-chain transfer) is meaningless — abort the migration.
@@ -261,29 +283,6 @@ pub mod migration {
 				Err(e) => log::warn!(
 					target: "runtime::stable-init",
 					"force_set_metadata failed: {:?}",
-					e,
-				),
-			}
-
-			// Assign the created id to the dynamic parameter so PSM picks it up.
-			let param = RuntimeParameters::Psm(
-				dynamic_params::psm::Parameters::StablecoinAssetId(
-					dynamic_params::psm::StablecoinAssetId,
-					Some(stable_id),
-				),
-			);
-			match pallet_parameters::Pallet::<Runtime>::set_parameter(
-				RuntimeOrigin::root(),
-				param,
-			) {
-				Ok(_) => log::info!(
-					target: "runtime::stable-init",
-					"StablecoinAssetId parameter set to {}",
-					stable_id,
-				),
-				Err(e) => log::warn!(
-					target: "runtime::stable-init",
-					"set_parameter(StablecoinAssetId) failed: {:?}",
 					e,
 				),
 			}

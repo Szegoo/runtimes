@@ -1348,23 +1348,14 @@ pub mod dynamic_params {
 	#[dynamic_pallet_params]
 	#[codec(index = 3)]
 	pub mod psm {
-		/// TrustBacked asset id of the internal stablecoin.
-		///
-		/// Configurable so the on-chain asset id can be assigned after the internal
-		/// stablecoin is registered, without requiring a runtime upgrade. Defaults to
-		/// the pre-allocated id; update via `Parameters::set_parameter` once the asset
-		/// is live.
-		#[codec(index = 0)]
-		pub static StablecoinAssetId: AssetIdForTrustBackedAssets = 50_000_413;
-
 		/// Hard cap on total internal-stablecoin issuance.
 		/// Default: 50M units @ 6 decimals.
-		#[codec(index = 1)]
+		#[codec(index = 0)]
 		pub static MaximumIssuance: Balance = 50_000_000 * 1_000_000;
 
 		/// Minimum size of a single mint/redeem swap.
 		/// Default: 1 unit @ 6 decimals.
-		#[codec(index = 2)]
+		#[codec(index = 1)]
 		pub static MinSwapAmount: Balance = 1_000_000;
 	}
 }
