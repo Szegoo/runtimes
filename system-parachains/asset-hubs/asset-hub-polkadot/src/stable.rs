@@ -15,48 +15,36 @@
 
 //! Peg Stability Module (PSM) configuration.
 //!
-//! Wires `pallet_psm` into the Asset Hub runtime: the PSM lets approved external stablecoins
-//! (e.g. USDT, Hollar) be swapped 1:1 for the Asset Hub-issued *internal stablecoin* up to
-//! a governance-controlled issuance cap, with fees routed to a dedicated insurance-fund
-//! sub-account.
-//!
-//! ## Contents
-//!
-//! - [`PsmPalletId`] / [`PsmFeeDestinationPalletId`] — sub-account derivation for the PSM custody
-//!   account and the fee-destination (insurance fund).
-//! - [`InternalStableAssetId`] — storage-backed `AssetId` of the internal stablecoin in the
-//!   TrustBacked `pallet_assets` instance. Set by [`migration::InitInternalStableLiquidity`] from
-//!   `pallet_assets::NextAssetId` at bootstrap time.
-//! - [`PsmFullLevel`] / [`PsmEmergencyOrigin`] — origin-to-`PsmManagerLevel` mapping. `Root` gets
-//!   `Full`; the `WhitelistedCaller` track gets `Emergency` (to be replaced with a dedicated
-//!   `MonetaryGuard` track).
-//! - [`PsmInternalAsset`] — single-asset `fungible` view over `pallet_assets` that `pallet_psm`
-//!   uses to mint/burn the internal stablecoin.
-//! - [`PsmBenchmarkHelper`] — runtime-benchmarks helper that fabricates unique foreign-asset
-//!   `Location`s in `ForeignAssets` so PSM benchmarks exercise the cross-chain path.
-//! - [`migration`] — one-shot bootstrap that creates the internal stablecoin, PSM-mints against
-//!   USDT, seeds the DOT/internal-stable pool, and pushes initial liquidity to Hydration. See the
-//!   module docs for details.
+//! Wires `pallet_psm` into Asset Hub: approved external stablecoins (USDT, Hollar) can be
+//! swapped 1:1 for the Asset Hub-issued internal stablecoin up to a governance-controlled
+//! issuance cap, with fees routed to a dedicated insurance-fund sub-account. The bootstrap
+//! migration that creates the internal stablecoin and seeds initial liquidity lives in the
+//! [`migration`] sub-module.
 
 use crate::*;
 
 parameter_types! {
-	/// PalletId for deriving the PSM system account that custodies external collateral.
+	/// `PalletId` deriving the PSM system account that custodies external collateral.
 	pub const PsmPalletId: PalletId = PalletId(*b"py/pegsm");
-	/// PalletId for deriving the PSM fee-destination (insurance fund) account.
+	/// `PalletId` deriving the PSM fee-destination (insurance fund) account.
 	pub const PsmFeeDestinationPalletId: PalletId = PalletId(*b"py/psmif");
+	/// Account fed by `pallet_psm` minting/redemption fees, derived from
+	/// `PsmFeeDestinationPalletId`.
 	pub PsmFeeDestination: AccountId =
 		PsmFeeDestinationPalletId::get().into_account_truncating();
 
 	/// Maximum number of approved external stablecoins.
 	pub const PsmMaxExternalAssets: u32 = 4;
 
-	/// Asset id of the internal stablecoin.
+	/// Asset id of the internal stablecoin in the TrustBacked `pallet_assets` instance.
+	///
+	/// Defaults to `0` and is overwritten by `migration::CreateInternalStable` from
+	/// `pallet_assets::NextAssetId` at runtime upgrade.
 	pub storage InternalStableAssetId: AssetIdForTrustBackedAssets = 0;
 }
 
-/// `TypedGet` impl returning `PsmManagerLevel::Full`. Used to map `Root` to the full
-/// management privilege of `pallet_psm` via `EnsureRootWithSuccess`.
+/// `TypedGet` returning `PsmManagerLevel::Full`, used with `EnsureRootWithSuccess` to
+/// give `Root` full management privilege over `pallet_psm`.
 pub struct PsmFullLevel;
 impl sp_core::TypedGet for PsmFullLevel {
 	type Type = pallet_psm::PsmManagerLevel;
@@ -65,6 +53,9 @@ impl sp_core::TypedGet for PsmFullLevel {
 	}
 }
 
+/// Origin granting `PsmManagerLevel::Emergency` to the `WhitelistedCaller` track.
+///
+/// To be replaced with a dedicated `MonetaryGuard` track once available.
 pub struct PsmEmergencyOrigin;
 impl<O> EnsureOrigin<O> for PsmEmergencyOrigin
 where
@@ -85,12 +76,13 @@ where
 	}
 }
 
-/// Single-asset `fungible` wrapper that the PSM uses to mint/burn the internal stablecoin.
+/// Single-asset `fungible` view over `pallet_assets` that `pallet_psm` uses to mint and
+/// burn the internal stablecoin.
 pub type PsmInternalAsset = fungible::ItemOf<Assets, InternalStableAssetId, AccountId>;
 
-/// Benchmark helper for `pallet_psm`. Generates unique foreign-asset `Location`s and
-/// creates them in `ForeignAssets` with metadata so the PSM benchmarks can drive
-/// mint/redeem flows.
+/// Benchmark helper for `pallet_psm`. Fabricates unique sibling-parachain asset `Location`s
+/// in `ForeignAssets` (with metadata) so PSM benchmarks exercise the cross-chain mint/redeem
+/// path rather than the local TrustBacked instance.
 #[cfg(feature = "runtime-benchmarks")]
 pub struct PsmBenchmarkHelper;
 #[cfg(feature = "runtime-benchmarks")]
@@ -150,34 +142,45 @@ impl pallet_psm::Config for Runtime {
 
 /// One-shot bootstrap of the internal stablecoin and its initial liquidity.
 ///
-/// Runs as a single-block `OnRuntimeUpgrade` and performs, in order:
+/// Split into two `OnRuntimeUpgrade` steps so that
+/// `pallet_psm::migrations::init::InitializePsm` can interleave between asset creation and
+/// the PSM-driven mint. The intended `Unreleased` ordering is:
 ///
-/// 1. Reads the next auto-incremented id from `pallet_assets::NextAssetId` and stores it in
-///    [`InternalStableAssetId`]. Aborts (with logged error) if unset.
-/// 2. `force_create`s the asset with the PSM-derived account as owner/issuer/admin/freezer so that
-///    [`pallet_psm`] can mint against it, and `force_set_metadata` writes the placeholder
-///    name/symbol/decimals.
-/// 3. Treasury PSM-mints [`PSM_MINT_AMOUNT`] of internal stable against USDT (TrustBacked id
-///    [`USDT_ASSET_ID`]).
-/// 4. Creates the DOT/internal-stable pool in `pallet_asset_conversion` and seeds it with
-///    [`POOL_DOT_AMOUNT`] DOT + [`POOL_STABLE_AMOUNT`] internal stable from Treasury.
-/// 5. Reserve-transfers [`TO_HYDRATION_AMOUNT`] of internal stable to the AH Treasury's sovereign
-///    account on Hydration (para `2034`), resolved via Hydration's `HashedDescription`
-///    `LocationToAccountId`.
+/// 1. `CreateInternalStable`: reads `pallet_assets::NextAssetId`, writes `InternalStableAssetId`,
+///    `force_create`s the asset with the PSM-derived account as owner/issuer/admin/freezer, and
+///    writes placeholder metadata.
+/// 2. `pallet_psm::migrations::init::InitializePsm<Runtime, RuntimePsmInitialConfig>`: registers
+///    USDT and Hollar as approved external assets, snapshots their decimals, and writes the initial
+///    PSM fees.
+/// 3. `SeedInternalStableLiquidity`: Treasury PSM-mints `PSM_MINT_AMOUNT` of internal stable
+///    against USDT, creates the DOT/internal-stable pool and seeds it with `POOL_DOT_AMOUNT` DOT
+///    plus `POOL_STABLE_AMOUNT` internal stable, then reserve-transfers `TO_HYDRATION_AMOUNT` of
+///    internal stable to the AH Treasury's sovereign account on Hydration.
 ///
-/// Steps 2–5 log on failure rather than aborting: the asset must exist for anything else to
-/// be meaningful, but a missing pool, failed mint, or failed XCM transfer can be retried via
-/// governance without re-running the whole migration.
+/// Failure semantics differ per step. Step 1 fails closed: if the asset cannot be created,
+/// nothing downstream is meaningful. Step 2 is upstream-owned and idempotent. Step 3 logs on
+/// per-step failure so a missing pool, failed mint, or failed XCM can be retried via
+/// governance without re-running the whole sequence.
 pub mod migration {
 	use super::*;
-	use alloc::boxed::Box;
+	use alloc::{boxed::Box, collections::btree_map::BTreeMap};
 	use frame_support::{pallet_prelude::Weight, traits::OnRuntimeUpgrade};
+	use sp_runtime::Permill;
 
 	const ASSET_HUB_PARA_ID: u32 = 1000;
 	const HYDRATION_PARA_ID: u32 = 2034;
 
 	/// USDT TrustBacked asset id on Asset Hub.
 	const USDT_ASSET_ID: u128 = 1984;
+
+	/// Hollar asset id on Hydration (para 2034).
+	const HOLLAR_ASSET_ID: u128 = 222;
+
+	/// Hollar's decimals as registered in AH `ForeignAssets`. PSM `InitializePsm` will
+	/// snapshot whatever live metadata says, so `pre_upgrade` asserts this value to make a
+	/// mismatch fail loudly instead of silently bricking PSM mint/redeem for Hollar.
+	#[cfg(feature = "try-runtime")]
+	const HOLLAR_DECIMALS: u8 = 18;
 
 	/// Decimals for the internal stablecoin. Must match `pallet_psm`'s expectation of
 	/// matching decimals across approved externals (USDT, Hollar, …) and the internal.
@@ -190,38 +193,75 @@ pub mod migration {
 	const STABLE_NAME: &[u8] = b"Internal Stable";
 	const STABLE_SYMBOL: &[u8] = b"TBD";
 
-	/// 1.5M USDT @ 6 decimals — Treasury PSM-mints this much internal stable against USDT.
+	/// 1.5M USDT @ 6 decimals. Treasury PSM-mints this much internal stable against USDT.
 	const PSM_MINT_AMOUNT: Balance = 1_500_000 * 1_000_000;
 
-	/// 500k DOT @ 10 decimals — half the seed for the DOT/internal-stable pool.
+	/// 500k DOT @ 10 decimals. Half the seed for the DOT/internal-stable pool.
 	const POOL_DOT_AMOUNT: Balance = 500_000 * 10_000_000_000;
 
-	/// 500k internal stable @ 6 decimals — other half of the pool seed.
+	/// 500k internal stable @ 6 decimals. Other half of the pool seed.
 	const POOL_STABLE_AMOUNT: Balance = 500_000 * 1_000_000;
 
-	/// 1M internal stable @ 6 decimals — Treasury sends this to its sov on Hydration.
+	/// 1M internal stable @ 6 decimals. Treasury sends this to its sovereign account on
+	/// Hydration.
 	const TO_HYDRATION_AMOUNT: Balance = 1_000_000 * 1_000_000;
 
-	pub struct InitInternalStableLiquidity;
+	/// USDT location used by PSM and the seeding migration. Local TrustBacked id 1984.
+	fn usdt_location() -> Location {
+		let assets_pallet_index =
+			<Assets as frame_support::pallet_prelude::PalletInfoAccess>::index() as u8;
+		Location::new(
+			0,
+			[Junction::PalletInstance(assets_pallet_index), Junction::GeneralIndex(USDT_ASSET_ID)],
+		)
+	}
 
-	impl OnRuntimeUpgrade for InitInternalStableLiquidity {
-		fn on_runtime_upgrade() -> Weight {
-			let treasury = pallet_treasury::Pallet::<Runtime>::account_id();
-			let origin = RuntimeOrigin::signed(treasury.clone());
+	/// Hollar location: sibling parachain 2034, asset 222.
+	fn hollar_location() -> Location {
+		Location::new(
+			1,
+			[Junction::Parachain(HYDRATION_PARA_ID), Junction::GeneralIndex(HOLLAR_ASSET_ID)],
+		)
+	}
 
-			let assets_pallet_index =
-				<Assets as frame_support::pallet_prelude::PalletInfoAccess>::index() as u8;
-			let usdt_loc = Location::new(
-				0,
-				[
-					Junction::PalletInstance(assets_pallet_index),
-					Junction::GeneralIndex(USDT_ASSET_ID),
-				],
+	/// Initial PSM parameters consumed by `pallet_psm::migrations::init::InitializePsm`:
+	///
+	/// - `max_psm_debt_of_total = 10%`.
+	/// - For both USDT and Hollar: `(minting_fee = 0%, redemption_fee = 0.01%, ceiling_weight =
+	///   100%)`. `minting_fee` MUST stay zero, otherwise `SeedInternalStableLiquidity` (which mints
+	///   exactly `PSM_MINT_AMOUNT`) would short itself by `fee` for the pool seed and Hydration
+	///   transfer.
+	pub struct RuntimePsmInitialConfig;
+	impl pallet_psm::migrations::init::InitialPsmConfig<Runtime> for RuntimePsmInitialConfig {
+		fn max_psm_debt_of_total() -> Permill {
+			Permill::from_percent(10)
+		}
+
+		fn asset_configs() -> BTreeMap<Location, (Permill, Permill, Permill)> {
+			let cfg: (Permill, Permill, Permill) = (
+				Permill::zero(),
+				Permill::from_rational(1u32, 10_000u32),
+				Permill::from_percent(100),
 			);
-			let dot_loc = xcm_config::DotLocation::get();
+			let mut m = BTreeMap::new();
+			m.insert(usdt_location(), cfg);
+			m.insert(hollar_location(), cfg);
+			m
+		}
+	}
 
-			// Take the next auto-incremented asset id from `pallet_assets`. If it's unset,
-			// abandon the migration.
+	/// Bootstrap step 1: create the internal stable asset.
+	///
+	/// Reads `pallet_assets::NextAssetId`, stores it in `InternalStableAssetId`,
+	/// `force_create`s the asset with the PSM-derived account as owner/issuer/admin/freezer
+	/// (so `pallet_psm::mint` can issue against it), and writes placeholder metadata.
+	///
+	/// Aborts on missing `NextAssetId` or `force_create` failure, since every downstream step
+	/// requires this asset to exist.
+	pub struct CreateInternalStable;
+
+	impl OnRuntimeUpgrade for CreateInternalStable {
+		fn on_runtime_upgrade() -> Weight {
 			let stable_id: AssetIdForTrustBackedAssets =
 				match pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::get() {
 					Some(id) => id,
@@ -240,12 +280,10 @@ pub mod migration {
 			// can issue against the asset.
 			let psm_account: AccountId = PsmPalletId::get().into_account_truncating();
 
-			// Hard precondition: if the asset can't be created, every downstream step
-			// (mint, pool, cross-chain transfer) is meaningless — abort the migration.
 			match pallet_assets::Pallet::<Runtime, TrustBackedAssetsInstance>::force_create(
 				RuntimeOrigin::root(),
 				codec::Compact(stable_id),
-				sp_runtime::MultiAddress::Id(psm_account.clone()),
+				sp_runtime::MultiAddress::Id(psm_account),
 				true, // is_sufficient
 				STABLE_MIN_BALANCE,
 			) {
@@ -257,7 +295,7 @@ pub mod migration {
 				Err(e) => {
 					log::error!(
 						target: "runtime::stable-init",
-						"force_create asset {} failed: {:?} — aborting bootstrap migration",
+						"force_create asset {} failed: {:?}; aborting bootstrap migration",
 						stable_id,
 						e,
 					);
@@ -287,6 +325,130 @@ pub mod migration {
 				),
 			}
 
+			Weight::from_parts(200_000_000_000, 200_000)
+		}
+
+		/// Asserts everything `on_runtime_upgrade` and the downstream `InitializePsm` /
+		/// `SeedInternalStableLiquidity` steps need from the live snapshot. Encodes the
+		/// chosen `NextAssetId` for `post_upgrade` to compare against.
+		#[cfg(feature = "try-runtime")]
+		fn pre_upgrade() -> Result<alloc::vec::Vec<u8>, sp_runtime::TryRuntimeError> {
+			use codec::Encode;
+			use frame_support::ensure;
+
+			let next_id = pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::get()
+				.ok_or::<sp_runtime::TryRuntimeError>(
+				"pre_upgrade: pallet_assets::NextAssetId is unset; \
+					 CreateInternalStable would silently abort"
+					.into(),
+			)?;
+
+			ensure!(
+				!pallet_assets::Asset::<Runtime, TrustBackedAssetsInstance>::contains_key(next_id),
+				"pre_upgrade: NextAssetId points at an already-existing asset"
+			);
+
+			ensure!(
+				InternalStableAssetId::get() == 0,
+				"pre_upgrade: InternalStableAssetId already set; migration appears to have run before"
+			);
+
+			// Hollar must already be registered as a foreign asset on AH with its real
+			// metadata, otherwise the next migration (`InitializePsm`) reads
+			// `T::Fungibles::decimals(hollar_loc)` and snapshots a wrong / zero value,
+			// silently breaking PSM mint/redeem.
+			let hollar = hollar_location();
+			ensure!(
+				pallet_assets::Asset::<Runtime, ForeignAssetsInstance>::contains_key(&hollar),
+				"pre_upgrade: Hollar is not registered in ForeignAssets; \
+				 register it via governance before this upgrade or remove it from \
+				 RuntimePsmInitialConfig"
+			);
+			let hollar_meta =
+				pallet_assets::Metadata::<Runtime, ForeignAssetsInstance>::get(&hollar);
+			ensure!(
+				hollar_meta.decimals == HOLLAR_DECIMALS,
+				"pre_upgrade: Hollar foreign-asset decimals do not match HOLLAR_DECIMALS"
+			);
+
+			Ok(next_id.encode())
+		}
+
+		#[cfg(feature = "try-runtime")]
+		fn post_upgrade(state: alloc::vec::Vec<u8>) -> Result<(), sp_runtime::TryRuntimeError> {
+			use codec::Decode;
+			use frame_support::ensure;
+
+			let pre_next_id: AssetIdForTrustBackedAssets = Decode::decode(&mut &state[..])
+				.map_err(|_| {
+					sp_runtime::TryRuntimeError::Other(
+						"post_upgrade: CreateInternalStable pre-state decode failed",
+					)
+				})?;
+
+			let stable_id = InternalStableAssetId::get();
+			ensure!(
+				stable_id == pre_next_id,
+				"post_upgrade: InternalStableAssetId does not match pre-upgrade NextAssetId"
+			);
+			ensure!(stable_id != 0, "post_upgrade: InternalStableAssetId still default");
+
+			let details =
+				pallet_assets::Asset::<Runtime, TrustBackedAssetsInstance>::get(stable_id)
+					.ok_or::<sp_runtime::TryRuntimeError>(
+					"post_upgrade: internal stable asset was not created".into(),
+				)?;
+			let psm_account: AccountId = PsmPalletId::get().into_account_truncating();
+			ensure!(
+				details.owner == psm_account,
+				"post_upgrade: asset owner is not PSM-derived account"
+			);
+			ensure!(details.is_sufficient, "post_upgrade: asset is not is_sufficient");
+			ensure!(
+				details.min_balance == STABLE_MIN_BALANCE,
+				"post_upgrade: asset min_balance mismatch"
+			);
+
+			let metadata =
+				pallet_assets::Metadata::<Runtime, TrustBackedAssetsInstance>::get(stable_id);
+			ensure!(&metadata.name[..] == STABLE_NAME, "post_upgrade: asset name mismatch");
+			ensure!(&metadata.symbol[..] == STABLE_SYMBOL, "post_upgrade: asset symbol mismatch");
+			ensure!(metadata.decimals == STABLE_DECIMALS, "post_upgrade: asset decimals mismatch");
+
+			Ok(())
+		}
+	}
+
+	/// Bootstrap step 3: produces the initial liquidity once the asset exists and PSM has
+	/// been initialized.
+	///
+	/// 1. Treasury PSM-mints `PSM_MINT_AMOUNT` of internal stable against USDT.
+	/// 2. Creates the DOT/internal-stable pool and seeds it with `POOL_DOT_AMOUNT` DOT and
+	///    `POOL_STABLE_AMOUNT` internal stable from Treasury.
+	/// 3. Reserve-transfers `TO_HYDRATION_AMOUNT` of internal stable to AH Treasury's sovereign
+	///    account on Hydration.
+	///
+	/// Each step logs on failure and continues, since the next step may still partially
+	/// succeed and is recoverable via governance.
+	pub struct SeedInternalStableLiquidity;
+
+	impl OnRuntimeUpgrade for SeedInternalStableLiquidity {
+		fn on_runtime_upgrade() -> Weight {
+			let stable_id = InternalStableAssetId::get();
+			if stable_id == 0 {
+				log::error!(
+					target: "runtime::stable-init",
+					"InternalStableAssetId unset; CreateInternalStable did not run \
+					 successfully; skipping seeding step",
+				);
+				return Weight::from_parts(100_000_000, 10_000);
+			}
+
+			let treasury = pallet_treasury::Pallet::<Runtime>::account_id();
+			let origin = RuntimeOrigin::signed(treasury.clone());
+
+			let assets_pallet_index =
+				<Assets as frame_support::pallet_prelude::PalletInfoAccess>::index() as u8;
 			let stable_loc = Location::new(
 				0,
 				[
@@ -294,9 +456,13 @@ pub mod migration {
 					Junction::GeneralIndex(stable_id as u128),
 				],
 			);
+			let dot_loc = xcm_config::DotLocation::get();
 
-			// Treasury PSM-mints internal stable against 1.5M USDT.
-			match pallet_psm::Pallet::<Runtime>::mint(origin.clone(), usdt_loc, PSM_MINT_AMOUNT) {
+			match pallet_psm::Pallet::<Runtime>::mint(
+				origin.clone(),
+				usdt_location(),
+				PSM_MINT_AMOUNT,
+			) {
 				Ok(_) => log::info!(
 					target: "runtime::stable-init",
 					"PSM mint OK: {} USDT-base-units swapped for internal stable",
@@ -309,17 +475,13 @@ pub mod migration {
 				),
 			}
 
-			// Create the DOT/internal-stable pool (idempotent — `PoolExists` is benign)
-			// and add 500k+500k liquidity owned by Treasury.
 			match pallet_asset_conversion::Pallet::<Runtime>::create_pool(
 				origin.clone(),
 				Box::new(dot_loc.clone()),
 				Box::new(stable_loc.clone()),
 			) {
-				Ok(_) => log::info!(
-					target: "runtime::stable-init",
-					"DOT/internal-stable pool created",
-				),
+				Ok(_) =>
+					log::info!(target: "runtime::stable-init", "DOT/internal-stable pool created"),
 				Err(e) => log::warn!(
 					target: "runtime::stable-init",
 					"create_pool failed (may already exist): {:?}",
@@ -348,19 +510,12 @@ pub mod migration {
 				),
 			}
 
-			// Reserve-transfer 1M internal stable to AH Treasury's sov on Hydration.
-			// `dest`        — Hydration, from AH's frame.
-			// `beneficiary` — AH Treasury location, written from Hydration's frame
-			//                 (`(1, [Parachain(1000), AccountId32(<treasury>)])`).
-			//                 Hydration's `LocationToAccountId` (HashedDescription)
-			//                 resolves it to a deterministic sovereign address controlled
-			//                 by AH Treasury via `Transact`.
 			let dest = Location::new(1, [Junction::Parachain(HYDRATION_PARA_ID)]);
 			let beneficiary = Location::new(
 				1,
 				[
 					Junction::Parachain(ASSET_HUB_PARA_ID),
-					Junction::AccountId32 { id: <[u8; 32]>::from(treasury.clone()), network: None },
+					Junction::AccountId32 { id: <[u8; 32]>::from(treasury), network: None },
 				],
 			);
 			let assets: xcm::v5::Assets = (stable_loc, TO_HYDRATION_AMOUNT).into();
@@ -384,40 +539,19 @@ pub mod migration {
 				),
 			}
 
-			// TODO: replace with a proper sum of pallet WeightInfo entries once each step
-			// is confirmed to use the expected dispatch path. The block where this
-			// migration runs will already include normal block work, so leave headroom.
-			Weight::from_parts(2_000_000_000_000, 1_000_000)
+			// TODO: replace with a proper sum of pallet WeightInfo entries once each step is
+			// confirmed to use the expected dispatch path.
+			Weight::from_parts(1_800_000_000_000, 800_000)
 		}
 
-		/// Capture preconditions and pre-state for [`Self::post_upgrade`].
-		///
-		/// Hard-fails if any precondition needed by the bootstrap is missing on the snapshot —
-		/// the migration's `on_runtime_upgrade` swallows most failures with `log::warn`, so
-		/// these `ensure!`s are the only signal that the live state is incompatible.
+		/// Captures Treasury's pre-seeding USDT and DOT balances so `post_upgrade` can verify
+		/// the exact decrements after the mint, pool seed, and XCM transfer.
 		#[cfg(feature = "try-runtime")]
 		fn pre_upgrade() -> Result<alloc::vec::Vec<u8>, sp_runtime::TryRuntimeError> {
 			use codec::Encode;
 			use frame_support::ensure;
 
 			let treasury = pallet_treasury::Pallet::<Runtime>::account_id();
-
-			let next_id = pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::get()
-				.ok_or::<sp_runtime::TryRuntimeError>(
-					"pre_upgrade: pallet_assets::NextAssetId is unset; \
-					 InitInternalStableLiquidity would silently abort"
-						.into(),
-				)?;
-
-			ensure!(
-				!pallet_assets::Asset::<Runtime, TrustBackedAssetsInstance>::contains_key(next_id),
-				"pre_upgrade: NextAssetId points at an already-existing asset"
-			);
-
-			ensure!(
-				InternalStableAssetId::get() == 0,
-				"pre_upgrade: InternalStableAssetId already set; migration appears to have run before"
-			);
 
 			let treasury_usdt =
 				pallet_assets::Pallet::<Runtime, TrustBackedAssetsInstance>::balance(
@@ -440,73 +574,39 @@ pub mod migration {
 				"pre_upgrade: dynamic_params::psm::MaximumIssuance smaller than PSM_MINT_AMOUNT"
 			);
 
-			Ok((next_id, treasury_usdt, treasury_dot).encode())
+			Ok((treasury_usdt, treasury_dot).encode())
 		}
 
-		/// Verify the bootstrap landed every step it advertises. Decodes pre-state from
-		/// `pre_upgrade` and asserts asset creation, PSM mint, AMM seed, and the outbound
-		/// XCM to Hydration. Hard-fails on any deviation.
+		/// Decodes pre-state and asserts the seeding step's full end-state: PSM mint
+		/// produced the right supply, USDT decrement matches, pool reserves match, DOT
+		/// decrement covers the seed, Treasury internal-stable balance is exactly zero, and
+		/// the outbound XCM to Hydration was emitted.
 		#[cfg(feature = "try-runtime")]
-		fn post_upgrade(
-			state: alloc::vec::Vec<u8>,
-		) -> Result<(), sp_runtime::TryRuntimeError> {
+		fn post_upgrade(state: alloc::vec::Vec<u8>) -> Result<(), sp_runtime::TryRuntimeError> {
 			use codec::Decode;
 			use frame_support::ensure;
 
-			let (pre_next_id, pre_usdt, pre_dot): (
-				AssetIdForTrustBackedAssets,
-				Balance,
-				Balance,
-			) = Decode::decode(&mut &state[..]).map_err(|_| {
-				sp_runtime::TryRuntimeError::Other("post_upgrade: pre-state decode failed")
-			})?;
+			let (pre_usdt, pre_dot): (Balance, Balance) =
+				Decode::decode(&mut &state[..]).map_err(|_| {
+					sp_runtime::TryRuntimeError::Other(
+						"post_upgrade: SeedInternalStableLiquidity pre-state decode failed",
+					)
+				})?;
 
 			let stable_id = InternalStableAssetId::get();
-			ensure!(
-				stable_id == pre_next_id,
-				"post_upgrade: InternalStableAssetId does not match pre-upgrade NextAssetId"
-			);
-			ensure!(stable_id != 0, "post_upgrade: InternalStableAssetId still default");
+			ensure!(stable_id != 0, "post_upgrade: InternalStableAssetId unset");
 
+			// Total issuance == PSM_MINT_AMOUNT regardless of how the PSM minting fee splits
+			// between Treasury and FeeDestination (matching decimals → no rounding).
 			let details =
 				pallet_assets::Asset::<Runtime, TrustBackedAssetsInstance>::get(stable_id)
 					.ok_or::<sp_runtime::TryRuntimeError>(
-						"post_upgrade: internal stable asset was not created".into(),
-					)?;
-			let psm_account: AccountId = PsmPalletId::get().into_account_truncating();
-			ensure!(
-				details.owner == psm_account,
-				"post_upgrade: asset owner is not PSM-derived account"
-			);
-			ensure!(details.is_sufficient, "post_upgrade: asset is not is_sufficient");
-			ensure!(
-				details.min_balance == STABLE_MIN_BALANCE,
-				"post_upgrade: asset min_balance mismatch"
-			);
-
-			let metadata =
-				pallet_assets::Metadata::<Runtime, TrustBackedAssetsInstance>::get(stable_id);
-			ensure!(
-				&metadata.name[..] == STABLE_NAME,
-				"post_upgrade: asset name mismatch"
-			);
-			ensure!(
-				&metadata.symbol[..] == STABLE_SYMBOL,
-				"post_upgrade: asset symbol mismatch"
-			);
-			ensure!(
-				metadata.decimals == STABLE_DECIMALS,
-				"post_upgrade: asset decimals mismatch"
-			);
-
-			// Total issuance == PSM_MINT_AMOUNT regardless of how the PSM minting fee splits
-			// between Treasury and FeeDestination (matching decimals → no rounding). If this
-			// is 0 the PSM mint never executed — most likely USDT was not registered as a
-			// PSM external asset.
+					"post_upgrade: internal stable asset missing".into(),
+				)?;
 			ensure!(
 				details.supply == PSM_MINT_AMOUNT,
 				"post_upgrade: internal stable total supply != PSM_MINT_AMOUNT \
-				 (PSM mint did not produce the expected amount; check USDT registration)"
+				 (PSM mint did not produce the expected amount)"
 			);
 
 			let treasury = pallet_treasury::Pallet::<Runtime>::account_id();
@@ -531,19 +631,13 @@ pub mod migration {
 			);
 			let dot_loc = xcm_config::DotLocation::get();
 			let (dot_reserve, stable_reserve) =
-				pallet_asset_conversion::Pallet::<Runtime>::get_reserves(
-					dot_loc,
-					stable_loc,
-				)
-				.map_err(|_| {
-					sp_runtime::TryRuntimeError::Other(
-						"post_upgrade: DOT/internal-stable pool not found",
-					)
-				})?;
-			ensure!(
-				dot_reserve == POOL_DOT_AMOUNT,
-				"post_upgrade: DOT pool reserve mismatch"
-			);
+				pallet_asset_conversion::Pallet::<Runtime>::get_reserves(dot_loc, stable_loc)
+					.map_err(|_| {
+						sp_runtime::TryRuntimeError::Other(
+							"post_upgrade: DOT/internal-stable pool not found",
+						)
+					})?;
+			ensure!(dot_reserve == POOL_DOT_AMOUNT, "post_upgrade: DOT pool reserve mismatch");
 			ensure!(
 				stable_reserve == POOL_STABLE_AMOUNT,
 				"post_upgrade: internal-stable pool reserve mismatch"

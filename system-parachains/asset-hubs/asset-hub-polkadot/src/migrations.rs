@@ -92,9 +92,16 @@ pub type Unreleased = (
 		DefaultDapBudget,
 		crate::dynamic_params::staking_election::MaxEraDuration,
 	>,
-	// PSM bootstrap: mint internal stable from Treasury USDT, seed AMM pool, fund
-	// Treasury sovereign on Hydration.
-	crate::stable::migration::InitInternalStableLiquidity,
+	// PSM bootstrap, three steps. Order is load-bearing:
+	//   1) create the internal stable asset (so InitializePsm can read its decimals),
+	//   2) initialize PSM with USDT and Hollar as approved external assets,
+	//   3) Treasury PSM-mints, seeds the AMM pool, sends initial liquidity to Hydration.
+	crate::stable::migration::CreateInternalStable,
+	pallet_psm::migrations::init::InitializePsm<
+		Runtime,
+		crate::stable::migration::RuntimePsmInitialConfig,
+	>,
+	crate::stable::migration::SeedInternalStableLiquidity,
 );
 
 /// Migrations/checks that do not need to be versioned and can run on every update.
