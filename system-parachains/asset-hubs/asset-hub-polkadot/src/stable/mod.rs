@@ -40,9 +40,9 @@ parameter_types! {
 
 	/// Asset id of the internal stablecoin in the TrustBacked `pallet_assets` instance.
 	///
-	/// Defaults to `0` and is overwritten by `migration::CreateInternalStable` from
-	/// `pallet_assets::NextAssetId` at runtime upgrade.
-	pub storage InternalStableAssetId: AssetIdForTrustBackedAssets = 0;
+	/// Hardcoded so PSM, the AMM pool, wallets, and indexers can rely on a stable id from
+	/// day one. `migration::CreateInternalStable` `force_create`s exactly this id.
+	pub const InternalStableAssetId: AssetIdForTrustBackedAssets = 444;
 }
 
 /// `TypedGet` returning `PsmManagerLevel::Full`, used with `EnsureRootWithSuccess` to

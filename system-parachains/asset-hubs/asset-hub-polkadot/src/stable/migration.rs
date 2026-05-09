@@ -122,49 +122,50 @@ impl pallet_psm::migrations::init::InitialPsmConfig<Runtime> for RuntimePsmIniti
 
 /// Bootstrap step 1: create the internal stable asset.
 ///
-/// Reads `pallet_assets::NextAssetId`, stores it in `InternalStableAssetId`,
-/// `force_create`s the asset with the PSM-derived account as owner/issuer/admin/freezer
-/// (so `pallet_psm::mint` can issue against it), and writes placeholder metadata.
+/// `force_create`s the asset at [`InternalStableAssetId`] (`444`) with the PSM-derived
+/// account as owner/issuer/admin/freezer (so `pallet_psm::mint` can issue against it),
+/// then writes placeholder metadata.
 ///
-/// Aborts on missing `NextAssetId` or `force_create` failure, since every downstream step
-/// requires this asset to exist.
+/// Aborts on `force_create` failure, since every downstream step requires the asset to
+/// exist.
 pub struct CreateInternalStable;
 
 impl OnRuntimeUpgrade for CreateInternalStable {
 	fn on_runtime_upgrade() -> Weight {
-		let stable_id: AssetIdForTrustBackedAssets =
-			match pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::get() {
-				Some(id) => id,
-				None => {
-					log::error!(
-						target: "runtime::stable-init",
-						"NextAssetId unset; aborting bootstrap migration",
-					);
-					return Weight::from_parts(100_000_000, 10_000);
-				},
-			};
+		let stable_id = InternalStableAssetId::get();
 
 		// Owner/issuer/admin/freezer = PSM-derived account so `pallet_psm::mint`
 		// can issue against the asset.
 		let psm_account: AccountId = PsmPalletId::get().into_account_truncating();
 
-		match pallet_assets::Pallet::<Runtime, TrustBackedAssetsInstance>::force_create(
-			RuntimeOrigin::root(),
-			codec::Compact(stable_id),
-			sp_runtime::MultiAddress::Id(psm_account),
-			true, // is_sufficient
-			STABLE_MIN_BALANCE,
-		) {
-			Ok(_) => {
-				// Only commit the id mapping once the asset truly exists, otherwise
-				// downstream consumers (PSM, the pool seed) would chase a phantom id.
-				InternalStableAssetId::set(&stable_id);
-				log::info!(
-					target: "runtime::stable-init",
-					"Internal stable asset {} force-created (owner = PSM)",
-					stable_id,
-				);
-			},
+		// `do_force_create` rejects `id != NextAssetId` when it's set (`Error::BadAssetId`).
+		// Override, create, then restore so the chain's auto-increment cursor stays where
+		// it was (`AutoIncAssetId` would have advanced it on success).
+		let saved_next_id =
+			pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::get();
+		pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::put(stable_id);
+
+		let force_create_result =
+			pallet_assets::Pallet::<Runtime, TrustBackedAssetsInstance>::force_create(
+				RuntimeOrigin::root(),
+				codec::Compact(stable_id),
+				sp_runtime::MultiAddress::Id(psm_account),
+				true, // is_sufficient
+				STABLE_MIN_BALANCE,
+			);
+
+		match saved_next_id {
+			Some(n) =>
+				pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::put(n),
+			None => pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::kill(),
+		}
+
+		match force_create_result {
+			Ok(_) => log::info!(
+				target: "runtime::stable-init",
+				"Internal stable asset {} force-created (owner = PSM)",
+				stable_id,
+			),
 			Err(e) => {
 				log::error!(
 					target: "runtime::stable-init",
@@ -201,57 +202,31 @@ impl OnRuntimeUpgrade for CreateInternalStable {
 		Weight::from_parts(200_000_000_000, 200_000)
 	}
 
-	/// Asserts everything `on_runtime_upgrade` and the downstream `InitializePsm` /
-	/// `SeedInternalStableLiquidity` steps need from the live snapshot. Encodes the
-	/// chosen `NextAssetId` for `post_upgrade` to compare against.
+	/// Asserts the hardcoded asset id is free on the live snapshot, otherwise
+	/// `force_create` would fail and the bootstrap would abort.
 	#[cfg(feature = "try-runtime")]
 	fn pre_upgrade() -> Result<alloc::vec::Vec<u8>, sp_runtime::TryRuntimeError> {
-		use codec::Encode;
 		use frame_support::ensure;
-
-		let next_id = pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::get()
-			.ok_or::<sp_runtime::TryRuntimeError>(
-			"pre_upgrade: pallet_assets::NextAssetId is unset; \
-				 CreateInternalStable would silently abort"
-				.into(),
-		)?;
-
-		ensure!(
-			!pallet_assets::Asset::<Runtime, TrustBackedAssetsInstance>::contains_key(next_id),
-			"pre_upgrade: NextAssetId points at an already-existing asset"
-		);
-
-		ensure!(
-			InternalStableAssetId::get() == 0,
-			"pre_upgrade: InternalStableAssetId already set; migration appears to have run before"
-		);
-
-		Ok(next_id.encode())
-	}
-
-	#[cfg(feature = "try-runtime")]
-	fn post_upgrade(state: alloc::vec::Vec<u8>) -> Result<(), sp_runtime::TryRuntimeError> {
-		use codec::Decode;
-		use frame_support::ensure;
-
-		let pre_next_id: AssetIdForTrustBackedAssets = Decode::decode(&mut &state[..])
-			.map_err(|_| {
-				sp_runtime::TryRuntimeError::Other(
-					"post_upgrade: CreateInternalStable pre-state decode failed",
-				)
-			})?;
 
 		let stable_id = InternalStableAssetId::get();
 		ensure!(
-			stable_id == pre_next_id,
-			"post_upgrade: InternalStableAssetId does not match pre-upgrade NextAssetId"
+			!pallet_assets::Asset::<Runtime, TrustBackedAssetsInstance>::contains_key(stable_id),
+			"pre_upgrade: InternalStableAssetId already exists as an asset; \
+			 CreateInternalStable would fail to create it"
 		);
 
-		let details =
-			pallet_assets::Asset::<Runtime, TrustBackedAssetsInstance>::get(stable_id)
-				.ok_or::<sp_runtime::TryRuntimeError>(
-				"post_upgrade: internal stable asset was not created".into(),
-			)?;
+		Ok(alloc::vec::Vec::new())
+	}
+
+	#[cfg(feature = "try-runtime")]
+	fn post_upgrade(_state: alloc::vec::Vec<u8>) -> Result<(), sp_runtime::TryRuntimeError> {
+		use frame_support::ensure;
+
+		let stable_id = InternalStableAssetId::get();
+		let details = pallet_assets::Asset::<Runtime, TrustBackedAssetsInstance>::get(stable_id)
+			.ok_or::<sp_runtime::TryRuntimeError>(
+			"post_upgrade: internal stable asset was not created".into(),
+		)?;
 		let psm_account: AccountId = PsmPalletId::get().into_account_truncating();
 		ensure!(
 			details.owner == psm_account,
@@ -289,11 +264,12 @@ pub struct SeedInternalStableLiquidity;
 impl OnRuntimeUpgrade for SeedInternalStableLiquidity {
 	fn on_runtime_upgrade() -> Weight {
 		let stable_id = InternalStableAssetId::get();
-		if stable_id == 0 {
+		if !pallet_assets::Asset::<Runtime, TrustBackedAssetsInstance>::contains_key(stable_id) {
 			log::error!(
 				target: "runtime::stable-init",
-				"InternalStableAssetId unset; CreateInternalStable did not run \
-				 successfully; skipping seeding step",
+				"Internal stable asset {} does not exist; \
+				 CreateInternalStable did not succeed; skipping seeding step",
+				stable_id,
 			);
 			return Weight::from_parts(100_000_000, 10_000);
 		}
@@ -437,7 +413,6 @@ impl OnRuntimeUpgrade for SeedInternalStableLiquidity {
 		use frame_support::ensure;
 
 		let stable_id = InternalStableAssetId::get();
-		ensure!(stable_id != 0, "post_upgrade: InternalStableAssetId unset");
 
 		// Total issuance == PSM_MINT_AMOUNT regardless of how the PSM minting fee splits
 		// between Treasury and FeeDestination (matching decimals → no rounding).
