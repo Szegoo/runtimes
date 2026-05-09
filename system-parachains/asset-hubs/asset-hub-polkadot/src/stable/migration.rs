@@ -19,25 +19,24 @@
 //! `pallet_psm::migrations::init::InitializePsm` can interleave between asset creation and
 //! the PSM-driven mint. The intended `Unreleased` ordering is:
 //!
-//! 1. [`CreateInternalStable`]: reads `pallet_assets::NextAssetId`, writes
-//!    `InternalStableAssetId`, `force_create`s the asset with the PSM-derived account as
-//!    owner/issuer/admin/freezer, and writes placeholder metadata.
+//! 1. [`CreateInternalStable`]: reads `pallet_assets::NextAssetId`, writes `InternalStableAssetId`,
+//!    `force_create`s the asset with the PSM-derived account as owner/issuer/admin/freezer, and
+//!    writes placeholder metadata.
 //! 2. `pallet_psm::migrations::init::InitializePsm<Runtime, `[`RuntimePsmInitialConfig`]`>`:
-//!    registers USDT and Hollar as approved external assets, snapshots their decimals, and
-//!    writes the initial PSM fees.
+//!    registers USDT and Hollar as approved external assets, snapshots their decimals, and writes
+//!    the initial PSM fees.
 //! 3. [`SeedInternalStableLiquidity`]: Treasury PSM-mints `PSM_MINT_AMOUNT` of internal stable
-//!    against USDT, creates the DOT/internal-stable pool and seeds it with `POOL_DOT_AMOUNT`
-//!    DOT plus `POOL_STABLE_AMOUNT` internal stable, then reserve-transfers
-//!    `TO_HYDRATION_AMOUNT` of internal stable to the AH Treasury's sovereign account on
-//!    Hydration.
+//!    against USDT, creates the DOT/internal-stable pool and seeds it with `POOL_DOT_AMOUNT` DOT
+//!    plus `POOL_STABLE_AMOUNT` internal stable, then reserve-transfers `TO_HYDRATION_AMOUNT` of
+//!    internal stable to the AH Treasury's sovereign account on Hydration.
 //!
 //! Failure semantics differ per step. Step 1 fails closed: if the asset cannot be created,
 //! nothing downstream is meaningful. Step 2 is upstream-owned and idempotent. Step 3 logs on
 //! per-step failure so a missing pool, failed mint, or failed XCM can be retried via
 //! governance without re-running the whole sequence.
 
-use crate::*;
 use super::*;
+use crate::*;
 
 use alloc::{boxed::Box, collections::btree_map::BTreeMap};
 use frame_support::{pallet_prelude::Weight, traits::OnRuntimeUpgrade};
@@ -97,10 +96,9 @@ fn hollar_location() -> Location {
 /// Initial PSM parameters consumed by `pallet_psm::migrations::init::InitializePsm`:
 ///
 /// - `max_psm_debt_of_total = 10%`.
-/// - For both USDT and Hollar: `(minting_fee = 0%, redemption_fee = 0.01%, ceiling_weight =
-///   100%)`. `minting_fee` MUST stay zero, otherwise [`SeedInternalStableLiquidity`] (which
-///   mints exactly `PSM_MINT_AMOUNT`) would short itself by `fee` for the pool seed and
-///   Hydration transfer.
+/// - For both USDT and Hollar: `(minting_fee = 0%, redemption_fee = 0.01%, ceiling_weight = 100%)`.
+///   `minting_fee` MUST stay zero, otherwise [`SeedInternalStableLiquidity`] (which mints exactly
+///   `PSM_MINT_AMOUNT`) would short itself by `fee` for the pool seed and Hydration transfer.
 pub struct RuntimePsmInitialConfig;
 impl pallet_psm::migrations::init::InitialPsmConfig<Runtime> for RuntimePsmInitialConfig {
 	fn max_psm_debt_of_total() -> Permill {
@@ -108,11 +106,8 @@ impl pallet_psm::migrations::init::InitialPsmConfig<Runtime> for RuntimePsmIniti
 	}
 
 	fn asset_configs() -> BTreeMap<Location, (Permill, Permill, Permill)> {
-		let cfg: (Permill, Permill, Permill) = (
-			Permill::zero(),
-			Permill::from_rational(1u32, 10_000u32),
-			Permill::from_percent(100),
-		);
+		let cfg: (Permill, Permill, Permill) =
+			(Permill::zero(), Permill::from_rational(1u32, 10_000u32), Permill::from_percent(100));
 		let mut m = BTreeMap::new();
 		m.insert(usdt_location(), cfg);
 		m.insert(hollar_location(), cfg);
@@ -141,8 +136,7 @@ impl OnRuntimeUpgrade for CreateInternalStable {
 		// `do_force_create` rejects `id != NextAssetId` when it's set (`Error::BadAssetId`).
 		// Override, create, then restore so the chain's auto-increment cursor stays where
 		// it was (`AutoIncAssetId` would have advanced it on success).
-		let saved_next_id =
-			pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::get();
+		let saved_next_id = pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::get();
 		pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::put(stable_id);
 
 		let force_create_result =
@@ -155,8 +149,7 @@ impl OnRuntimeUpgrade for CreateInternalStable {
 			);
 
 		match saved_next_id {
-			Some(n) =>
-				pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::put(n),
+			Some(n) => pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::put(n),
 			None => pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::kill(),
 		}
 
@@ -254,11 +247,13 @@ impl OnRuntimeUpgrade for CreateInternalStable {
 /// 1. Treasury PSM-mints `PSM_MINT_AMOUNT` of internal stable against USDT.
 /// 2. Creates the DOT/internal-stable pool and seeds it with `POOL_DOT_AMOUNT` DOT and
 ///    `POOL_STABLE_AMOUNT` internal stable from Treasury.
-/// 3. Reserve-transfers `TO_HYDRATION_AMOUNT` of internal stable to AH Treasury's sovereign
-///    account on Hydration.
+/// 3. Reserve-transfers `TO_HYDRATION_AMOUNT` of internal stable to AH Treasury's sovereign account
+///    on Hydration.
 ///
-/// Each step logs on failure and continues, since the next step may still partially
-/// succeed and is recoverable via governance.
+/// Aborts on the first step that fails so the chain ends in an unambiguous partial state;
+/// governance can fix the root cause and dispatch the remaining steps directly.
+/// `create_pool` returning [`pallet_asset_conversion::Error::PoolExists`] is treated as
+/// benign and the migration continues.
 pub struct SeedInternalStableLiquidity;
 
 impl OnRuntimeUpgrade for SeedInternalStableLiquidity {
@@ -288,38 +283,44 @@ impl OnRuntimeUpgrade for SeedInternalStableLiquidity {
 		);
 		let dot_loc = xcm_config::DotLocation::get();
 
-		match pallet_psm::Pallet::<Runtime>::mint(
-			origin.clone(),
-			usdt_location(),
-			PSM_MINT_AMOUNT,
-		) {
-			Ok(_) => log::info!(
+		if let Err(e) =
+			pallet_psm::Pallet::<Runtime>::mint(origin.clone(), usdt_location(), PSM_MINT_AMOUNT)
+		{
+			log::error!(
 				target: "runtime::stable-init",
-				"PSM mint OK: {} USDT-base-units swapped for internal stable",
-				PSM_MINT_AMOUNT,
-			),
-			Err(e) => log::warn!(
-				target: "runtime::stable-init",
-				"PSM mint failed: {:?}",
+				"PSM mint failed: {:?}; aborting seeding step",
 				e,
-			),
+			);
+			return Weight::from_parts(100_000_000, 10_000);
 		}
+		log::info!(
+			target: "runtime::stable-init",
+			"PSM mint OK: {} USDT-base-units swapped for internal stable",
+			PSM_MINT_AMOUNT,
+		);
 
 		match pallet_asset_conversion::Pallet::<Runtime>::create_pool(
 			origin.clone(),
 			Box::new(dot_loc.clone()),
 			Box::new(stable_loc.clone()),
 		) {
-			Ok(_) =>
-				log::info!(target: "runtime::stable-init", "DOT/internal-stable pool created"),
-			Err(e) => log::warn!(
-				target: "runtime::stable-init",
-				"create_pool failed (may already exist): {:?}",
-				e,
-			),
+			Ok(_) => log::info!(target: "runtime::stable-init", "DOT/internal-stable pool created"),
+			Err(e) if e == pallet_asset_conversion::Error::<Runtime>::PoolExists.into() =>
+				log::info!(
+					target: "runtime::stable-init",
+					"DOT/internal-stable pool already exists; continuing",
+				),
+			Err(e) => {
+				log::error!(
+					target: "runtime::stable-init",
+					"create_pool failed: {:?}; aborting seeding step",
+					e,
+				);
+				return Weight::from_parts(100_000_000, 10_000);
+			},
 		}
 
-		match pallet_asset_conversion::Pallet::<Runtime>::add_liquidity(
+		if let Err(e) = pallet_asset_conversion::Pallet::<Runtime>::add_liquidity(
 			origin.clone(),
 			Box::new(dot_loc),
 			Box::new(stable_loc.clone()),
@@ -329,16 +330,17 @@ impl OnRuntimeUpgrade for SeedInternalStableLiquidity {
 			0,
 			treasury.clone(),
 		) {
-			Ok(_) => log::info!(
+			log::error!(
 				target: "runtime::stable-init",
-				"Pool seeded with 500k DOT / 500k internal stable",
-			),
-			Err(e) => log::warn!(
-				target: "runtime::stable-init",
-				"add_liquidity failed: {:?}",
+				"add_liquidity failed: {:?}; aborting seeding step",
 				e,
-			),
+			);
+			return Weight::from_parts(100_000_000, 10_000);
 		}
+		log::info!(
+			target: "runtime::stable-init",
+			"Pool seeded with 500k DOT / 500k internal stable",
+		);
 
 		let dest = Location::new(1, [Junction::Parachain(HYDRATION_PARA_ID)]);
 		let beneficiary = Location::new(
@@ -350,7 +352,7 @@ impl OnRuntimeUpgrade for SeedInternalStableLiquidity {
 		);
 		let assets: xcm::v5::Assets = (stable_loc, TO_HYDRATION_AMOUNT).into();
 
-		match pallet_xcm::Pallet::<Runtime>::limited_reserve_transfer_assets(
+		if let Err(e) = pallet_xcm::Pallet::<Runtime>::limited_reserve_transfer_assets(
 			origin,
 			Box::new(VersionedLocation::from(dest)),
 			Box::new(VersionedLocation::from(beneficiary)),
@@ -358,16 +360,17 @@ impl OnRuntimeUpgrade for SeedInternalStableLiquidity {
 			0,
 			xcm::v5::WeightLimit::Unlimited,
 		) {
-			Ok(_) => log::info!(
+			log::error!(
 				target: "runtime::stable-init",
-				"1M internal stable sent to Hydration (AH Treasury sov)",
-			),
-			Err(e) => log::warn!(
-				target: "runtime::stable-init",
-				"reserve transfer to Hydration failed: {:?}",
+				"reserve transfer to Hydration failed: {:?}; aborting seeding step",
 				e,
-			),
+			);
+			return Weight::from_parts(100_000_000, 10_000);
 		}
+		log::info!(
+			target: "runtime::stable-init",
+			"1M internal stable sent to Hydration (AH Treasury sov)",
+		);
 
 		// TODO: replace with a proper sum of pallet WeightInfo entries once each step is
 		// confirmed to use the expected dispatch path.
@@ -452,10 +455,9 @@ impl OnRuntimeUpgrade for SeedInternalStableLiquidity {
 
 		// mint(1.5M) - pool(500k) - xcm(1M) = 0, exact when PSM minting fee is zero.
 		let treasury = pallet_treasury::Pallet::<Runtime>::account_id();
-		let treasury_stable =
-			pallet_assets::Pallet::<Runtime, TrustBackedAssetsInstance>::balance(
-				stable_id, &treasury,
-			);
+		let treasury_stable = pallet_assets::Pallet::<Runtime, TrustBackedAssetsInstance>::balance(
+			stable_id, &treasury,
+		);
 		ensure!(
 			treasury_stable == 0,
 			"post_upgrade: Treasury still holds internal stable; \
@@ -463,13 +465,12 @@ impl OnRuntimeUpgrade for SeedInternalStableLiquidity {
 		);
 
 		let hydration = Location::new(1, [Junction::Parachain(HYDRATION_PARA_ID)]);
-		let sent_to_hydration = frame_system::Pallet::<Runtime>::read_events_no_consensus().any(
-			|er| match &er.event {
+		let sent_to_hydration =
+			frame_system::Pallet::<Runtime>::read_events_no_consensus().any(|er| match &er.event {
 				RuntimeEvent::PolkadotXcm(pallet_xcm::Event::Sent { destination, .. }) =>
 					destination == &hydration,
 				_ => false,
-			},
-		);
+			});
 		ensure!(
 			sent_to_hydration,
 			"post_upgrade: no pallet_xcm::Sent event for Hydration; \
