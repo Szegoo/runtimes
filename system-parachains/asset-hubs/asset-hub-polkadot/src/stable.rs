@@ -389,6 +389,198 @@ pub mod migration {
 			// migration runs will already include normal block work, so leave headroom.
 			Weight::from_parts(2_000_000_000_000, 1_000_000)
 		}
+
+		/// Capture preconditions and pre-state for [`Self::post_upgrade`].
+		///
+		/// Hard-fails if any precondition needed by the bootstrap is missing on the snapshot —
+		/// the migration's `on_runtime_upgrade` swallows most failures with `log::warn`, so
+		/// these `ensure!`s are the only signal that the live state is incompatible.
+		#[cfg(feature = "try-runtime")]
+		fn pre_upgrade() -> Result<alloc::vec::Vec<u8>, sp_runtime::TryRuntimeError> {
+			use codec::Encode;
+			use frame_support::ensure;
+
+			let treasury = pallet_treasury::Pallet::<Runtime>::account_id();
+
+			let next_id = pallet_assets::NextAssetId::<Runtime, TrustBackedAssetsInstance>::get()
+				.ok_or::<sp_runtime::TryRuntimeError>(
+					"pre_upgrade: pallet_assets::NextAssetId is unset; \
+					 InitInternalStableLiquidity would silently abort"
+						.into(),
+				)?;
+
+			ensure!(
+				!pallet_assets::Asset::<Runtime, TrustBackedAssetsInstance>::contains_key(next_id),
+				"pre_upgrade: NextAssetId points at an already-existing asset"
+			);
+
+			ensure!(
+				InternalStableAssetId::get() == 0,
+				"pre_upgrade: InternalStableAssetId already set; migration appears to have run before"
+			);
+
+			let treasury_usdt =
+				pallet_assets::Pallet::<Runtime, TrustBackedAssetsInstance>::balance(
+					USDT_ASSET_ID as AssetIdForTrustBackedAssets,
+					&treasury,
+				);
+			ensure!(
+				treasury_usdt >= PSM_MINT_AMOUNT,
+				"pre_upgrade: Treasury USDT balance below PSM_MINT_AMOUNT"
+			);
+
+			let treasury_dot = pallet_balances::Pallet::<Runtime>::free_balance(&treasury);
+			ensure!(
+				treasury_dot >= POOL_DOT_AMOUNT,
+				"pre_upgrade: Treasury free DOT balance below POOL_DOT_AMOUNT"
+			);
+
+			ensure!(
+				dynamic_params::psm::MaximumIssuance::get() >= PSM_MINT_AMOUNT,
+				"pre_upgrade: dynamic_params::psm::MaximumIssuance smaller than PSM_MINT_AMOUNT"
+			);
+
+			Ok((next_id, treasury_usdt, treasury_dot).encode())
+		}
+
+		/// Verify the bootstrap landed every step it advertises. Decodes pre-state from
+		/// `pre_upgrade` and asserts asset creation, PSM mint, AMM seed, and the outbound
+		/// XCM to Hydration. Hard-fails on any deviation.
+		#[cfg(feature = "try-runtime")]
+		fn post_upgrade(
+			state: alloc::vec::Vec<u8>,
+		) -> Result<(), sp_runtime::TryRuntimeError> {
+			use codec::Decode;
+			use frame_support::ensure;
+
+			let (pre_next_id, pre_usdt, pre_dot): (
+				AssetIdForTrustBackedAssets,
+				Balance,
+				Balance,
+			) = Decode::decode(&mut &state[..]).map_err(|_| {
+				sp_runtime::TryRuntimeError::Other("post_upgrade: pre-state decode failed")
+			})?;
+
+			let stable_id = InternalStableAssetId::get();
+			ensure!(
+				stable_id == pre_next_id,
+				"post_upgrade: InternalStableAssetId does not match pre-upgrade NextAssetId"
+			);
+			ensure!(stable_id != 0, "post_upgrade: InternalStableAssetId still default");
+
+			let details =
+				pallet_assets::Asset::<Runtime, TrustBackedAssetsInstance>::get(stable_id)
+					.ok_or::<sp_runtime::TryRuntimeError>(
+						"post_upgrade: internal stable asset was not created".into(),
+					)?;
+			let psm_account: AccountId = PsmPalletId::get().into_account_truncating();
+			ensure!(
+				details.owner == psm_account,
+				"post_upgrade: asset owner is not PSM-derived account"
+			);
+			ensure!(details.is_sufficient, "post_upgrade: asset is not is_sufficient");
+			ensure!(
+				details.min_balance == STABLE_MIN_BALANCE,
+				"post_upgrade: asset min_balance mismatch"
+			);
+
+			let metadata =
+				pallet_assets::Metadata::<Runtime, TrustBackedAssetsInstance>::get(stable_id);
+			ensure!(
+				&metadata.name[..] == STABLE_NAME,
+				"post_upgrade: asset name mismatch"
+			);
+			ensure!(
+				&metadata.symbol[..] == STABLE_SYMBOL,
+				"post_upgrade: asset symbol mismatch"
+			);
+			ensure!(
+				metadata.decimals == STABLE_DECIMALS,
+				"post_upgrade: asset decimals mismatch"
+			);
+
+			// Total issuance == PSM_MINT_AMOUNT regardless of how the PSM minting fee splits
+			// between Treasury and FeeDestination (matching decimals → no rounding). If this
+			// is 0 the PSM mint never executed — most likely USDT was not registered as a
+			// PSM external asset.
+			ensure!(
+				details.supply == PSM_MINT_AMOUNT,
+				"post_upgrade: internal stable total supply != PSM_MINT_AMOUNT \
+				 (PSM mint did not produce the expected amount; check USDT registration)"
+			);
+
+			let treasury = pallet_treasury::Pallet::<Runtime>::account_id();
+			let treasury_usdt_post =
+				pallet_assets::Pallet::<Runtime, TrustBackedAssetsInstance>::balance(
+					USDT_ASSET_ID as AssetIdForTrustBackedAssets,
+					&treasury,
+				);
+			ensure!(
+				pre_usdt.saturating_sub(treasury_usdt_post) == PSM_MINT_AMOUNT,
+				"post_upgrade: Treasury USDT decrement != PSM_MINT_AMOUNT"
+			);
+
+			let assets_pallet_index =
+				<Assets as frame_support::pallet_prelude::PalletInfoAccess>::index() as u8;
+			let stable_loc = Location::new(
+				0,
+				[
+					Junction::PalletInstance(assets_pallet_index),
+					Junction::GeneralIndex(stable_id as u128),
+				],
+			);
+			let dot_loc = xcm_config::DotLocation::get();
+			let (dot_reserve, stable_reserve) =
+				pallet_asset_conversion::Pallet::<Runtime>::get_reserves(
+					dot_loc,
+					stable_loc,
+				)
+				.map_err(|_| {
+					sp_runtime::TryRuntimeError::Other(
+						"post_upgrade: DOT/internal-stable pool not found",
+					)
+				})?;
+			ensure!(
+				dot_reserve == POOL_DOT_AMOUNT,
+				"post_upgrade: DOT pool reserve mismatch"
+			);
+			ensure!(
+				stable_reserve == POOL_STABLE_AMOUNT,
+				"post_upgrade: internal-stable pool reserve mismatch"
+			);
+
+			let treasury_dot_post = pallet_balances::Pallet::<Runtime>::free_balance(&treasury);
+			ensure!(
+				pre_dot.saturating_sub(treasury_dot_post) >= POOL_DOT_AMOUNT,
+				"post_upgrade: Treasury DOT decrement smaller than POOL_DOT_AMOUNT"
+			);
+
+			// mint(1.5M) - pool(500k) - xcm(1M) = 0, exact when PSM minting fee is zero.
+			let treasury_stable =
+				pallet_assets::Pallet::<Runtime, TrustBackedAssetsInstance>::balance(
+					stable_id, &treasury,
+				);
+			ensure!(
+				treasury_stable == 0,
+				"post_upgrade: Treasury still holds internal stable; \
+				 migration accounting drifted (non-zero PSM fee or failed downstream step)"
+			);
+
+			let hydration = Location::new(1, [Junction::Parachain(HYDRATION_PARA_ID)]);
+			let sent_to_hydration = frame_system::Pallet::<Runtime>::read_events_no_consensus()
+				.any(|er| match &er.event {
+					RuntimeEvent::PolkadotXcm(pallet_xcm::Event::Sent { destination, .. }) =>
+						destination == &hydration,
+					_ => false,
+				});
+			ensure!(
+				sent_to_hydration,
+				"post_upgrade: no pallet_xcm::Sent event for Hydration; \
+				 reserve transfer did not execute"
+			);
+
+			Ok(())
+		}
 	}
 }
 
