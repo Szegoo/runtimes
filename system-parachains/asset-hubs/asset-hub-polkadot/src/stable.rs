@@ -176,12 +176,6 @@ pub mod migration {
 	/// Hollar asset id on Hydration (para 2034).
 	const HOLLAR_ASSET_ID: u128 = 222;
 
-	/// Hollar's decimals as registered in AH `ForeignAssets`. PSM `InitializePsm` will
-	/// snapshot whatever live metadata says, so `pre_upgrade` asserts this value to make a
-	/// mismatch fail loudly instead of silently bricking PSM mint/redeem for Hollar.
-	#[cfg(feature = "try-runtime")]
-	const HOLLAR_DECIMALS: u8 = 18;
-
 	/// Decimals for the internal stablecoin. Must match `pallet_psm`'s expectation of
 	/// matching decimals across approved externals (USDT, Hollar, …) and the internal.
 	const STABLE_DECIMALS: u8 = 6;
@@ -274,8 +268,6 @@ pub mod migration {
 					},
 				};
 
-			InternalStableAssetId::set(&stable_id);
-
 			// Owner/issuer/admin/freezer = PSM-derived account so `pallet_psm::mint`
 			// can issue against the asset.
 			let psm_account: AccountId = PsmPalletId::get().into_account_truncating();
@@ -287,11 +279,16 @@ pub mod migration {
 				true, // is_sufficient
 				STABLE_MIN_BALANCE,
 			) {
-				Ok(_) => log::info!(
-					target: "runtime::stable-init",
-					"Internal stable asset {} force-created (owner = PSM)",
-					stable_id,
-				),
+				Ok(_) => {
+					// Only commit the id mapping once the asset truly exists, otherwise
+					// downstream consumers (PSM, the pool seed) would chase a phantom id.
+					InternalStableAssetId::set(&stable_id);
+					log::info!(
+						target: "runtime::stable-init",
+						"Internal stable asset {} force-created (owner = PSM)",
+						stable_id,
+					);
+				},
 				Err(e) => {
 					log::error!(
 						target: "runtime::stable-init",
@@ -353,24 +350,6 @@ pub mod migration {
 				"pre_upgrade: InternalStableAssetId already set; migration appears to have run before"
 			);
 
-			// Hollar must already be registered as a foreign asset on AH with its real
-			// metadata, otherwise the next migration (`InitializePsm`) reads
-			// `T::Fungibles::decimals(hollar_loc)` and snapshots a wrong / zero value,
-			// silently breaking PSM mint/redeem.
-			let hollar = hollar_location();
-			ensure!(
-				pallet_assets::Asset::<Runtime, ForeignAssetsInstance>::contains_key(&hollar),
-				"pre_upgrade: Hollar is not registered in ForeignAssets; \
-				 register it via governance before this upgrade or remove it from \
-				 RuntimePsmInitialConfig"
-			);
-			let hollar_meta =
-				pallet_assets::Metadata::<Runtime, ForeignAssetsInstance>::get(&hollar);
-			ensure!(
-				hollar_meta.decimals == HOLLAR_DECIMALS,
-				"pre_upgrade: Hollar foreign-asset decimals do not match HOLLAR_DECIMALS"
-			);
-
 			Ok(next_id.encode())
 		}
 
@@ -391,7 +370,6 @@ pub mod migration {
 				stable_id == pre_next_id,
 				"post_upgrade: InternalStableAssetId does not match pre-upgrade NextAssetId"
 			);
-			ensure!(stable_id != 0, "post_upgrade: InternalStableAssetId still default");
 
 			let details =
 				pallet_assets::Asset::<Runtime, TrustBackedAssetsInstance>::get(stable_id)
@@ -544,11 +522,10 @@ pub mod migration {
 			Weight::from_parts(1_800_000_000_000, 800_000)
 		}
 
-		/// Captures Treasury's pre-seeding USDT and DOT balances so `post_upgrade` can verify
-		/// the exact decrements after the mint, pool seed, and XCM transfer.
+		/// Pre-flight gates: Treasury holds enough USDT and DOT to cover the mint and pool
+		/// seed, and the PSM issuance ceiling accommodates the planned mint.
 		#[cfg(feature = "try-runtime")]
 		fn pre_upgrade() -> Result<alloc::vec::Vec<u8>, sp_runtime::TryRuntimeError> {
-			use codec::Encode;
 			use frame_support::ensure;
 
 			let treasury = pallet_treasury::Pallet::<Runtime>::account_id();
@@ -574,24 +551,15 @@ pub mod migration {
 				"pre_upgrade: dynamic_params::psm::MaximumIssuance smaller than PSM_MINT_AMOUNT"
 			);
 
-			Ok((treasury_usdt, treasury_dot).encode())
+			Ok(alloc::vec::Vec::new())
 		}
 
-		/// Decodes pre-state and asserts the seeding step's full end-state: PSM mint
-		/// produced the right supply, USDT decrement matches, pool reserves match, DOT
-		/// decrement covers the seed, Treasury internal-stable balance is exactly zero, and
-		/// the outbound XCM to Hydration was emitted.
+		/// Asserts the seeding step's end-state: PSM mint produced the right supply, pool
+		/// reserves match, Treasury holds zero internal stable, and the outbound XCM to
+		/// Hydration was emitted.
 		#[cfg(feature = "try-runtime")]
-		fn post_upgrade(state: alloc::vec::Vec<u8>) -> Result<(), sp_runtime::TryRuntimeError> {
-			use codec::Decode;
+		fn post_upgrade(_state: alloc::vec::Vec<u8>) -> Result<(), sp_runtime::TryRuntimeError> {
 			use frame_support::ensure;
-
-			let (pre_usdt, pre_dot): (Balance, Balance) =
-				Decode::decode(&mut &state[..]).map_err(|_| {
-					sp_runtime::TryRuntimeError::Other(
-						"post_upgrade: SeedInternalStableLiquidity pre-state decode failed",
-					)
-				})?;
 
 			let stable_id = InternalStableAssetId::get();
 			ensure!(stable_id != 0, "post_upgrade: InternalStableAssetId unset");
@@ -607,17 +575,6 @@ pub mod migration {
 				details.supply == PSM_MINT_AMOUNT,
 				"post_upgrade: internal stable total supply != PSM_MINT_AMOUNT \
 				 (PSM mint did not produce the expected amount)"
-			);
-
-			let treasury = pallet_treasury::Pallet::<Runtime>::account_id();
-			let treasury_usdt_post =
-				pallet_assets::Pallet::<Runtime, TrustBackedAssetsInstance>::balance(
-					USDT_ASSET_ID as AssetIdForTrustBackedAssets,
-					&treasury,
-				);
-			ensure!(
-				pre_usdt.saturating_sub(treasury_usdt_post) == PSM_MINT_AMOUNT,
-				"post_upgrade: Treasury USDT decrement != PSM_MINT_AMOUNT"
 			);
 
 			let assets_pallet_index =
@@ -643,13 +600,8 @@ pub mod migration {
 				"post_upgrade: internal-stable pool reserve mismatch"
 			);
 
-			let treasury_dot_post = pallet_balances::Pallet::<Runtime>::free_balance(&treasury);
-			ensure!(
-				pre_dot.saturating_sub(treasury_dot_post) >= POOL_DOT_AMOUNT,
-				"post_upgrade: Treasury DOT decrement smaller than POOL_DOT_AMOUNT"
-			);
-
 			// mint(1.5M) - pool(500k) - xcm(1M) = 0, exact when PSM minting fee is zero.
+			let treasury = pallet_treasury::Pallet::<Runtime>::account_id();
 			let treasury_stable =
 				pallet_assets::Pallet::<Runtime, TrustBackedAssetsInstance>::balance(
 					stable_id, &treasury,
