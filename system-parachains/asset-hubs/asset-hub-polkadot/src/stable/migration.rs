@@ -15,25 +15,30 @@
 
 //! One-shot bootstrap of the internal stablecoin and its initial liquidity.
 //!
-//! Split into two `OnRuntimeUpgrade` steps so that
+//! Split across multiple `OnRuntimeUpgrade` steps so that
 //! `pallet_psm::migrations::init::InitializePsm` can interleave between asset creation and
 //! the PSM-driven mint. The intended `Unreleased` ordering is:
 //!
-//! 1. [`CreateInternalStable`]: reads `pallet_assets::NextAssetId`, writes `InternalStableAssetId`,
-//!    `force_create`s the asset with the PSM-derived account as owner/issuer/admin/freezer, and
-//!    writes placeholder metadata.
-//! 2. `pallet_psm::migrations::init::InitializePsm<Runtime, `[`RuntimePsmInitialConfig`]`>`:
-//!    registers USDT and Hollar as approved external assets, snapshots their decimals, and writes
-//!    the initial PSM fees.
-//! 3. [`SeedInternalStableLiquidity`]: Treasury PSM-mints `PSM_MINT_AMOUNT` of internal stable
-//!    against USDT, creates the DOT/internal-stable pool and seeds it with `POOL_DOT_AMOUNT` DOT
-//!    plus `POOL_STABLE_AMOUNT` internal stable, then reserve-transfers `TO_HYDRATION_AMOUNT` of
-//!    internal stable to the AH Treasury's sovereign account on Hydration.
+//! 1. `CreateInternalStable`: `force_create`s the internal stablecoin at the hardcoded
+//!    `InternalStableAssetId` with the PSM-derived account as
+//!    owner/issuer/admin/freezer, and writes placeholder metadata.
+//! 2. `pallet_psm::migrations::init::InitializePsm<Runtime, RuntimePsmInitialConfig>`:
+//!    registers USDT and Hollar as approved external assets, snapshots their decimals,
+//!    and writes the initial PSM fees.
+//! 3. `SeedInternalStableLiquidity`: Treasury PSM-mints `PSM_MINT_AMOUNT` of internal
+//!    stable against USDT, creates the DOT/internal-stable pool and seeds it with
+//!    `POOL_DOT_AMOUNT` DOT plus `POOL_STABLE_AMOUNT` internal stable, then
+//!    reserve-transfers `TO_HYDRATION_AMOUNT` of internal stable to the AH Treasury's
+//!    sovereign account on Hydration.
+//! 4. `BootstrapHollarBackedStable`: dispatches an XCM to Hydration that withdraws
+//!    Treasury's HOLLAR back to AH and schedules a follow-up `pallet_psm::mint` against
+//!    HOLLAR `HOLLAR_TRANSFER_DELAY_BLOCKS` blocks later, after HRMP delivery.
 //!
-//! Failure semantics differ per step. Step 1 fails closed: if the asset cannot be created,
-//! nothing downstream is meaningful. Step 2 is upstream-owned and idempotent. Step 3 logs on
-//! per-step failure so a missing pool, failed mint, or failed XCM can be retried via
-//! governance without re-running the whole sequence.
+//! Failure semantics differ per step. Steps 1, 3, and 4 fail closed and abort the
+//! migration so the chain ends in an unambiguous partial state that governance can
+//! recover by dispatching the remaining calls directly. Step 2 is upstream-owned and
+//! idempotent. In step 3 a `PoolExists` error from `create_pool` is treated as benign so
+//! a re-run after an upstream pool already exists is harmless.
 
 use super::*;
 use crate::*;
@@ -75,6 +80,20 @@ const POOL_STABLE_AMOUNT: Balance = 500_000 * 1_000_000;
 /// Hydration.
 const TO_HYDRATION_AMOUNT: Balance = 1_000_000 * 1_000_000;
 
+/// 1.5M HOLLAR @ 18 decimals. Amount the scheduled call PSM-mints once HOLLAR has
+/// been pulled back from Hydration to Treasury on AH.
+const HOLLAR_PSM_MINT_AMOUNT: Balance = 1_500_000 * 1_000_000_000_000_000_000;
+
+/// 1.5M HOLLAR + 100 HOLLAR (~$100) buffer for XCM execution fees on both legs
+/// (Hydration `BuyExecution` and AH-side `BuyExecution`). Surplus stays as dust in
+/// Treasury's HOLLAR balance after the mint consumes `HOLLAR_PSM_MINT_AMOUNT`.
+const HOLLAR_WITHDRAW_AMOUNT: Balance = 1_500_100 * 1_000_000_000_000_000_000;
+
+/// 100 blocks @ 6s = 10 minutes. Generous margin over the typical HRMP round-trip
+/// (4 to 12 blocks) so the scheduled mint doesn't fire before HOLLAR has arrived in
+/// Treasury.
+const HOLLAR_TRANSFER_DELAY_BLOCKS: BlockNumber = 100;
+
 /// USDT location used by PSM and the seeding migration. Local TrustBacked id 1984.
 fn usdt_location() -> Location {
 	let assets_pallet_index =
@@ -93,12 +112,13 @@ fn hollar_location() -> Location {
 	)
 }
 
-/// Initial PSM parameters consumed by `pallet_psm::migrations::init::InitializePsm`:
+/// Initial PSM parameters consumed by `pallet_psm::migrations::init::InitializePsm`.
 ///
 /// - `max_psm_debt_of_total = 10%`.
-/// - For both USDT and Hollar: `(minting_fee = 0%, redemption_fee = 0.01%, ceiling_weight = 100%)`.
-///   `minting_fee` MUST stay zero, otherwise [`SeedInternalStableLiquidity`] (which mints exactly
-///   `PSM_MINT_AMOUNT`) would short itself by `fee` for the pool seed and Hydration transfer.
+/// - For both USDT and Hollar: `(minting_fee = 0%, redemption_fee = 0.01%, ceiling_weight
+///   = 100%)`. `minting_fee` MUST stay zero, otherwise `SeedInternalStableLiquidity`
+///   (which mints exactly `PSM_MINT_AMOUNT`) would short itself by `fee` for the pool
+///   seed and Hydration transfer.
 pub struct RuntimePsmInitialConfig;
 impl pallet_psm::migrations::init::InitialPsmConfig<Runtime> for RuntimePsmInitialConfig {
 	fn max_psm_debt_of_total() -> Permill {
@@ -117,9 +137,14 @@ impl pallet_psm::migrations::init::InitialPsmConfig<Runtime> for RuntimePsmIniti
 
 /// Bootstrap step 1: create the internal stable asset.
 ///
-/// `force_create`s the asset at [`InternalStableAssetId`] (`444`) with the PSM-derived
-/// account as owner/issuer/admin/freezer (so `pallet_psm::mint` can issue against it),
-/// then writes placeholder metadata.
+/// `force_create`s the asset at the hardcoded `InternalStableAssetId` with the
+/// PSM-derived account as owner/issuer/admin/freezer (so `pallet_psm::mint` can issue
+/// against it), then writes placeholder metadata.
+///
+/// `pallet_assets::do_force_create` rejects `id != NextAssetId` when `NextAssetId` is set,
+/// so the migration temporarily overrides `NextAssetId` to the chosen id, performs
+/// `force_create`, then restores the previous value to keep the auto-increment cursor
+/// where it was.
 ///
 /// Aborts on `force_create` failure, since every downstream step requires the asset to
 /// exist.
@@ -247,12 +272,12 @@ impl OnRuntimeUpgrade for CreateInternalStable {
 /// 1. Treasury PSM-mints `PSM_MINT_AMOUNT` of internal stable against USDT.
 /// 2. Creates the DOT/internal-stable pool and seeds it with `POOL_DOT_AMOUNT` DOT and
 ///    `POOL_STABLE_AMOUNT` internal stable from Treasury.
-/// 3. Reserve-transfers `TO_HYDRATION_AMOUNT` of internal stable to AH Treasury's sovereign account
-///    on Hydration.
+/// 3. Reserve-transfers `TO_HYDRATION_AMOUNT` of internal stable to AH Treasury's
+///    sovereign account on Hydration.
 ///
 /// Aborts on the first step that fails so the chain ends in an unambiguous partial state;
 /// governance can fix the root cause and dispatch the remaining steps directly.
-/// `create_pool` returning [`pallet_asset_conversion::Error::PoolExists`] is treated as
+/// `create_pool` returning `pallet_asset_conversion::Error::PoolExists` is treated as
 /// benign and the migration continues.
 pub struct SeedInternalStableLiquidity;
 
@@ -475,6 +500,187 @@ impl OnRuntimeUpgrade for SeedInternalStableLiquidity {
 			sent_to_hydration,
 			"post_upgrade: no pallet_xcm::Sent event for Hydration; \
 			 reserve transfer did not execute"
+		);
+
+		Ok(())
+	}
+}
+
+/// Bootstrap step 4: pull HOLLAR from Hydration and schedule a PSM mint against it.
+///
+/// The HOLLAR side of the bootstrap can't fit in a single block: HOLLAR lives on
+/// Hydration, so an XCM has to pull it back, HRMP delivery has to land, and only then
+/// can `pallet_psm::mint` issue internal stable against it. This migration does the
+/// synchronous half (dispatch XCM, schedule the mint); `pallet_scheduler` runs the
+/// second half later.
+///
+/// 1. `pallet_xcm::send` to Hydration: `WithdrawAsset(local_HOLLAR, 1.5M + buffer)`
+///    from AH Treasury's sub-sovereign on Hydration, `BuyExecution`, then
+///    `DepositReserveAsset` back to AH Treasury.
+/// 2. `pallet_scheduler::schedule(at = now + HOLLAR_TRANSFER_DELAY_BLOCKS,
+///    call = Utility::dispatch_as(Treasury_signed, pallet_psm::mint(hollar_loc, 1.5M)))`.
+///
+/// Aborts on either step's error so the chain ends in an unambiguous partial state.
+/// If the scheduled mint itself fails when it fires (e.g. HOLLAR didn't arrive in time),
+/// governance retries via direct calls.
+pub struct BootstrapHollarBackedStable;
+
+impl OnRuntimeUpgrade for BootstrapHollarBackedStable {
+	fn on_runtime_upgrade() -> Weight {
+		let treasury = pallet_treasury::Pallet::<Runtime>::account_id();
+
+		// XCM payload, written from Hydration's frame:
+		//   - `local_HOLLAR` is `(0, [GeneralIndex(222)])` from Hydration's frame.
+		//   - `AH` is `(1, [Parachain(1000)])` from Hydration's frame.
+		//   - Inner xcm runs on AH; `hollar_location()` is HOLLAR's foreign-asset id on AH.
+		let hollar_local_on_hydration =
+			Location::new(0, [Junction::GeneralIndex(HOLLAR_ASSET_ID)]);
+		let ah_from_hydration = Location::new(1, [Junction::Parachain(ASSET_HUB_PARA_ID)]);
+		let beneficiary = Location::new(
+			0,
+			[Junction::AccountId32 {
+				id: <[u8; 32]>::from(treasury.clone()),
+				network: None,
+			}],
+		);
+
+		let withdraw = xcm::v5::Asset {
+			id: xcm::v5::AssetId(hollar_local_on_hydration.clone()),
+			fun: xcm::v5::Fungibility::Fungible(HOLLAR_WITHDRAW_AMOUNT),
+		};
+		let inner_xcm: xcm::v5::Xcm<()> = xcm::v5::Xcm(alloc::vec![
+			xcm::v5::Instruction::BuyExecution {
+				fees: xcm::v5::Asset {
+					id: xcm::v5::AssetId(hollar_location()),
+					fun: xcm::v5::Fungibility::Fungible(HOLLAR_WITHDRAW_AMOUNT),
+				},
+				weight_limit: xcm::v5::WeightLimit::Unlimited,
+			},
+			xcm::v5::Instruction::DepositAsset {
+				assets: xcm::v5::AssetFilter::Wild(xcm::v5::WildAsset::AllCounted(1)),
+				beneficiary,
+			},
+		]);
+		let xcm: xcm::v5::Xcm<()> = xcm::v5::Xcm(alloc::vec![
+			xcm::v5::Instruction::WithdrawAsset(xcm::v5::Assets::from(alloc::vec![
+				withdraw.clone()
+			])),
+			xcm::v5::Instruction::BuyExecution {
+				fees: withdraw,
+				weight_limit: xcm::v5::WeightLimit::Unlimited,
+			},
+			xcm::v5::Instruction::DepositReserveAsset {
+				assets: xcm::v5::AssetFilter::Wild(xcm::v5::WildAsset::AllCounted(1)),
+				dest: ah_from_hydration,
+				xcm: inner_xcm,
+			},
+		]);
+
+		let dest = Location::new(1, [Junction::Parachain(HYDRATION_PARA_ID)]);
+		if let Err(e) = pallet_xcm::Pallet::<Runtime>::send(
+			RuntimeOrigin::signed(treasury.clone()),
+			Box::new(VersionedLocation::from(dest)),
+			Box::new(VersionedXcm::from(xcm)),
+		) {
+			log::error!(
+				target: "runtime::stable-init",
+				"pallet_xcm::send for HOLLAR pull failed: {:?}; aborting bootstrap migration",
+				e,
+			);
+			return Weight::from_parts(100_000_000, 10_000);
+		}
+		log::info!(
+			target: "runtime::stable-init",
+			"Sent XCM to Hydration to withdraw {} HOLLAR base units",
+			HOLLAR_WITHDRAW_AMOUNT,
+		);
+
+		// Schedule `pallet_psm::mint(hollar_loc, 1.5M)` to fire at `now + 100 blocks`,
+		// run as Treasury-signed via `pallet_utility::dispatch_as` (mint requires
+		// Signed; scheduler dispatches with whatever origin we encode).
+		let signed_treasury_origin: OriginCaller =
+			frame_system::RawOrigin::Signed(treasury).into();
+		let mint_call: RuntimeCall = RuntimeCall::Psm(pallet_psm::Call::<Runtime>::mint {
+			asset_id: hollar_location(),
+			external_amount: HOLLAR_PSM_MINT_AMOUNT,
+		});
+		let dispatch_as_call: RuntimeCall =
+			RuntimeCall::Utility(pallet_utility::Call::<Runtime>::dispatch_as {
+				as_origin: Box::new(signed_treasury_origin),
+				call: Box::new(mint_call),
+			});
+
+		let when = frame_system::Pallet::<Runtime>::block_number()
+			.saturating_add(HOLLAR_TRANSFER_DELAY_BLOCKS);
+		if let Err(e) = pallet_scheduler::Pallet::<Runtime>::schedule(
+			RuntimeOrigin::root(),
+			when,
+			None,
+			0,
+			Box::new(dispatch_as_call),
+		) {
+			log::error!(
+				target: "runtime::stable-init",
+				"pallet_scheduler::schedule for HOLLAR mint failed: {:?}; \
+				 aborting bootstrap migration",
+				e,
+			);
+			return Weight::from_parts(100_000_000, 10_000);
+		}
+		log::info!(
+			target: "runtime::stable-init",
+			"Scheduled HOLLAR PSM mint of {} for block {}",
+			HOLLAR_PSM_MINT_AMOUNT,
+			when,
+		);
+
+		// TODO: replace with a proper sum of pallet WeightInfo entries.
+		Weight::from_parts(1_000_000_000_000, 500_000)
+	}
+
+	/// Pre-flight gate: PSM has issuance headroom for the additional 1.5M.
+	/// Treasury's HOLLAR sub-sovereign balance on Hydration can't be inspected from
+	/// AH state; chopsticks validation covers that.
+	#[cfg(feature = "try-runtime")]
+	fn pre_upgrade() -> Result<alloc::vec::Vec<u8>, sp_runtime::TryRuntimeError> {
+		use frame_support::ensure;
+
+		// `SeedInternalStableLiquidity` already minted 1.5M internal stable; HOLLAR mint
+		// adds another 1.5M (1.5M HOLLAR @ 18 decimals → 1.5M internal stable @ 6 decimals).
+		// Total 3M required of headroom against `MaximumIssuance` (default 50M).
+		ensure!(
+			dynamic_params::psm::MaximumIssuance::get() >= PSM_MINT_AMOUNT.saturating_mul(2),
+			"pre_upgrade: MaximumIssuance smaller than combined USDT + HOLLAR mint"
+		);
+
+		Ok(alloc::vec::Vec::new())
+	}
+
+	/// Asserts an outbound XCM to Hydration was sent and a `pallet_psm::mint` is
+	/// queued in `pallet_scheduler` at the expected block.
+	#[cfg(feature = "try-runtime")]
+	fn post_upgrade(_state: alloc::vec::Vec<u8>) -> Result<(), sp_runtime::TryRuntimeError> {
+		use frame_support::ensure;
+
+		let hydration = Location::new(1, [Junction::Parachain(HYDRATION_PARA_ID)]);
+		let sent_to_hydration =
+			frame_system::Pallet::<Runtime>::read_events_no_consensus().any(|er| match &er.event {
+				RuntimeEvent::PolkadotXcm(pallet_xcm::Event::Sent { destination, .. }) =>
+					destination == &hydration,
+				_ => false,
+			});
+		ensure!(
+			sent_to_hydration,
+			"post_upgrade: no pallet_xcm::Sent event for Hydration; \
+			 HOLLAR pull XCM did not dispatch"
+		);
+
+		let when = frame_system::Pallet::<Runtime>::block_number()
+			.saturating_add(HOLLAR_TRANSFER_DELAY_BLOCKS);
+		let agenda = pallet_scheduler::Agenda::<Runtime>::get(when);
+		ensure!(
+			!agenda.is_empty(),
+			"post_upgrade: pallet_scheduler::Agenda has no entry at the expected block"
 		);
 
 		Ok(())

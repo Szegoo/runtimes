@@ -92,16 +92,19 @@ pub type Unreleased = (
 		DefaultDapBudget,
 		crate::dynamic_params::staking_election::MaxEraDuration,
 	>,
-	// PSM bootstrap, three steps. Order is load-bearing:
+	// PSM bootstrap, four steps. Order is load-bearing:
 	//   1) create the internal stable asset (so InitializePsm can read its decimals),
 	//   2) initialize PSM with USDT and Hollar as approved external assets,
-	//   3) Treasury PSM-mints, seeds the AMM pool, sends initial liquidity to Hydration.
+	//   3) Treasury PSM-mints against USDT, seeds the AMM pool, sends 1M to Hydration,
+	//   4) dispatch XCM to pull HOLLAR from Hydration and schedule a PSM mint against it
+	//      for ~10 minutes later (to wait for HRMP round-trip).
 	crate::stable::migration::CreateInternalStable,
 	pallet_psm::migrations::init::InitializePsm<
 		Runtime,
 		crate::stable::migration::RuntimePsmInitialConfig,
 	>,
 	crate::stable::migration::SeedInternalStableLiquidity,
+	crate::stable::migration::BootstrapHollarBackedStable,
 );
 
 /// Migrations/checks that do not need to be versioned and can run on every update.
